@@ -90,7 +90,8 @@ src/
 │   └── dtype.rs                 # Data type conversions
 ├── datasource/
 │   ├── zarr.rs                  # ZarrTable: DataFusion TableProvider
-│   └── factory.rs               # TableFactory for registering Zarr tables
+│   ├── factory.rs               # TableFactory for registering Zarr tables
+│   └── object_store_registry.rs # http(s)/gs/s3 stores for Parquet/CSV/JSON tables
 ├── optimizer/
 │   ├── mod.rs                   # Optimizer module exports
 │   ├── minmax_optimization.rs   # MIN()/MAX() → constant folding from stats
