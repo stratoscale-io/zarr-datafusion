@@ -9,11 +9,51 @@ runs.
 |------|--------------|-----|------|
 | [`pincode_temperature.sql`](pincode_temperature.sql) | 8 pincodes × 24 hourly steps → mean/max/min temperature | 8 rows | ~56 MB |
 | [`met_feature_fusion.sql`](met_feature_fusion.sql) | 6 variables → 6 derived features, per city | 6 rows | ~394 MB |
+| [`postcode_met_features.sql`](postcode_met_features.sql) | same 6 cities, pincodes resolved from **Parquet** ⋈ ERA5 **Zarr** | 6 rows | ~788 MB |
 
 ```bash
 zarr-cli cookbook/pincode-lookup/pincode_temperature.sql
 zarr-cli cookbook/pincode-lookup/met_feature_fusion.sql
+zarr-cli cookbook/pincode-lookup/postcode_met_features.sql   # Parquet read from Hugging Face
 ```
+
+## Tabular ⋈ gridded: pincodes from Parquet
+
+The first two recipes hard-code coordinates in a `VALUES` list.
+`postcode_met_features.sql` runs the same six cities and features as
+`met_feature_fusion.sql`, but resolves each city's GPO pincode from a real
+lookup table — [GeoNames postal codes](https://download.geonames.org/export/zip/)
+(1.8M rows, 121 countries, CC-BY 4.0) converted to Parquet by
+[`build_postcodes.sql`](build_postcodes.sql) and published at
+[`Stratoscale/GeoNamesPincode`](https://huggingface.co/datasets/Stratoscale/GeoNamesPincode)
+on Hugging Face — and joins it onto the ERA5 Zarr store in the same statement.
+Two formats, two data models, two clouds, one query:
+
+```sql
+CREATE EXTERNAL TABLE postcodes STORED AS PARQUET
+  LOCATION 'https://huggingface.co/datasets/Stratoscale/GeoNamesPincode/resolve/main/postal_codes.parquet';
+CREATE EXTERNAL TABLE era5 STORED AS ZARR
+  LOCATION 'gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3';
+```
+
+```
+city       postal_code  places  acc  grid_lat  grid_lon  wind_ms  blh_m  vent_coef_m2s
+Delhi      110001           21    4     28.75     77.25     1.66    457        761
+Hyderabad  500001            5    1     17.5      78.5      2.61    593       1550
+Mumbai     400001            6    1     19.0      72.75     3.89    431       1676
+Bengaluru  560001            9    4     13.25     77.5      2.61    699       1821
+Chennai    600001            6    4     13.0      80.25     3.32    578       1923
+Kolkata    700001           14    1     22.5      88.25     3.50    643       2251
+```
+
+Hyderabad, Mumbai, Chennai and Kolkata land on the same cell as the hand-picked
+coordinates and reproduce `met_feature_fusion.sql` exactly. Delhi and Bengaluru
+land one cell north: GeoNames has no official Indian pincode geometry and
+geocodes by place name, and `accuracy` records how a point was derived, not how
+close it is — most `560xxx` pincodes share one fallback district point ~28 km
+north of the Bengaluru GPO. The query carries `places` and `accuracy` into the
+output so that provenance stays visible; the lookup is only as good as the
+table behind it.
 
 ## The trick: snap the lookup, not the grid
 

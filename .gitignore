@@ -35,3 +35,6 @@ bench/**/__pycache__/
 
 # Invention disclosure — kept out of the public repo.
 docs/exact-cardinality-invention-disclosure.md
+
+# GeoNames downloads (published at huggingface.co/datasets/Stratoscale/GeoNamesPincode)
+data/geonames/
