@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::util::pretty::print_batches;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -15,6 +16,7 @@ use rustyline::error::ReadlineError;
 use rustyline::Editor;
 use tracing_subscriber::EnvFilter;
 use zarr_datafusion::datasource::factory::ZarrTableFactory;
+use zarr_datafusion::datasource::object_store_registry::RemoteObjectStoreRegistry;
 use zarr_datafusion::optimizer::{
     CardinalityRule, CountStatisticsRule, MinMaxStatisticsRule, ZarrLimitPushdownRule,
 };
@@ -217,9 +219,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let config = SessionConfig::new().with_information_schema(true);
+    // Lets Parquet/CSV/JSON tables use http(s)://, gs:// and s3:// locations
+    // (Zarr tables open their own stores).
+    let runtime = RuntimeEnvBuilder::new()
+        .with_object_store_registry(Arc::new(RemoteObjectStoreRegistry::new()))
+        .build_arc()?;
     let state = SessionStateBuilder::new()
         .with_default_features()
         .with_config(config)
+        .with_runtime_env(runtime)
         .with_table_factory("ZARR".to_string(), Arc::new(ZarrTableFactory) as _)
         .with_optimizer_rule(Arc::new(CountStatisticsRule::new()))
         .with_optimizer_rule(Arc::new(MinMaxStatisticsRule::new()))
