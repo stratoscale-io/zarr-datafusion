@@ -853,6 +853,25 @@ fn plan_outer_coord_read(sel: &CoordSelection) -> (u64, u64, CoordSelection) {
     }
 }
 
+/// `[start, end)` widened to whole chunks of `chunk_len` within `len`: what
+/// decoding the slice reads anyway, and the same for every partition in those
+/// chunks. Unknown chunking leaves it as is.
+fn widen_to_chunks(start: u64, end: u64, chunk_len: Option<u64>, len: u64) -> (u64, u64) {
+    match chunk_len.filter(|&c| c > 0) {
+        Some(c) if start < end => ((start / c) * c, end.div_ceil(c).saturating_mul(c).min(len)),
+        _ => (start, end),
+    }
+}
+
+fn shift_selection(sel: CoordSelection, by: usize) -> CoordSelection {
+    match sel {
+        CoordSelection::Range(s, e) => CoordSelection::Range(s + by, e + by),
+        CoordSelection::Indices(v) => {
+            CoordSelection::Indices(v.into_iter().map(|i| i + by).collect())
+        }
+    }
+}
+
 /// A view of `filters` with the outer coord's filter removed, when that coord's
 /// selection is supplied by the partition (and so resolved on the head).
 ///
@@ -2199,7 +2218,14 @@ pub async fn read_zarr_async(
         let sel = partition_selection
             .as_ref()
             .expect("outer_slice_idx implies Some");
-        (i, plan_outer_coord_read(sel))
+        let (rs, re, extract_sel) = plan_outer_coord_read(sel);
+        let coord = &store_meta.coords[i];
+        let chunk_len = coord.chunks.as_ref().and_then(|c| c.first().copied());
+        let (cs, ce) = widen_to_chunks(rs, re, chunk_len, coord.shape[0]);
+        (
+            i,
+            (cs, ce, shift_selection(extract_sel, (rs - cs) as usize)),
+        )
     });
     let all_coord_values: Vec<CoordValues> = futures::future::try_join_all(
         store_meta
@@ -2231,10 +2257,14 @@ pub async fn read_zarr_async(
                         ))
                     };
                     match outer_read {
-                        Some((_, (rs, re, _))) => {
+                        Some((_, (cs, ce, _))) => {
                             let subset =
-                                ArraySubset::new_with_ranges(std::slice::from_ref(&(*rs..*re)));
-                            read(subset, (re - rs) as usize).await
+                                ArraySubset::new_with_ranges(std::slice::from_ref(&(*cs..*ce)));
+                            cache
+                                .coord(&format!("{array_path}[{cs}..{ce}]"), || {
+                                    read(subset, (ce - cs) as usize)
+                                })
+                                .await
                         }
                         None => {
                             let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
@@ -3182,7 +3212,7 @@ mod async_streaming_tests {
     }
 
     #[tokio::test]
-    async fn partitions_sharing_a_cache_read_the_inner_coordinates_once() {
+    async fn partitions_sharing_a_cache_read_each_coordinate_chunk_once() {
         let coord_reads = |stats: &SharedIoStats| {
             stats
                 .coord_arrays
@@ -3194,12 +3224,21 @@ mod async_streaming_tests {
         let cache = Arc::new(ScanCache::default());
         let batches = read_partitions(|| cache.clone(), shared.clone()).await;
 
-        // time, lat and lon for each of the 7 partitions, or lat and lon once
-        // and each partition's own time step.
+        // time, lat and lon for each of the 7 partitions, or each once: time is
+        // one chunk, which every partition's step falls in.
         assert_eq!(coord_reads(&alone), 21);
-        assert_eq!(coord_reads(&shared), 2 + 7);
+        assert_eq!(coord_reads(&shared), 3);
         assert_eq!(rows(&batches), 700);
         assert_eq!(rendered(&batches), rendered(&reference));
+    }
+
+    #[test]
+    fn a_slice_widens_to_the_chunks_it_falls_in() {
+        assert_eq!(widen_to_chunks(3, 5, Some(4), 10), (0, 8));
+        assert_eq!(widen_to_chunks(8, 9, Some(4), 10), (8, 10));
+        assert_eq!(widen_to_chunks(4, 8, Some(4), 10), (4, 8));
+        assert_eq!(widen_to_chunks(3, 5, None, 10), (3, 5));
+        assert_eq!(widen_to_chunks(0, 0, Some(4), 10), (0, 0));
     }
 
     fn rows(batches: &[RecordBatch]) -> usize {
