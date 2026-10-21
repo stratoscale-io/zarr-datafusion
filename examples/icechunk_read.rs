@@ -16,7 +16,7 @@ use std::sync::Arc;
 use icechunk::repository::VersionInfo;
 use icechunk::{new_local_filesystem_storage, Repository, RepositoryConfig};
 use zarrs::array::Array;
-use zarrs::array_subset::ArraySubset;
+use zarrs::array::ArraySubset;
 use zarrs_icechunk::AsyncIcechunkStore;
 
 #[tokio::main]
@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let temp = Array::async_open(store.clone(), "/temperature").await?;
     let subset = ArraySubset::new_with_shape(temp.shape().to_vec());
     let data = temp
-        .async_retrieve_array_subset_ndarray::<f64>(&subset)
+        .async_retrieve_array_subset::<ndarray::ArrayD<f64>>(&subset)
         .await?;
     println!("temperature ndim={} shape={:?}", data.ndim(), data.shape());
 
@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Also read a coordinate array to confirm 1-D reads.
     let lat = Array::async_open(store.clone(), "/lat").await?;
     let lat_data = lat
-        .async_retrieve_array_subset_ndarray::<f64>(&ArraySubset::new_with_shape(
+        .async_retrieve_array_subset::<ndarray::ArrayD<f64>>(&ArraySubset::new_with_shape(
             lat.shape().to_vec(),
         ))
         .await?;

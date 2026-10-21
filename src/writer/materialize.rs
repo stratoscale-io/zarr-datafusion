@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use zarrs::array::Array;
-use zarrs::array_subset::ArraySubset;
+use zarrs::array::ArraySubset;
 use zarrs::filesystem::FilesystemStore;
 
 use datafusion::physical_plan::ExecutionPlan;
@@ -50,62 +50,20 @@ fn load_coord(
     let read = |e: zarrs::array::ArrayError| -> BoxError { Box::new(e) };
     Ok(match dtype {
         "float32" => {
-            let v = arr
-                .retrieve_array_subset_ndarray::<f32>(&full)
-                .map_err(read)?
-                .into_raw_vec_and_offset()
-                .0;
+            let v = arr.retrieve_array_subset::<Vec<f32>>(&full).map_err(read)?;
             CoordValues::Float64(v.into_iter().map(|x| x as f64).collect())
         }
-        "float64" => CoordValues::Float64(
-            arr.retrieve_array_subset_ndarray::<f64>(&full)
-                .map_err(read)?
-                .into_raw_vec_and_offset()
-                .0,
-        ),
-        "int8" => int64_from(
-            arr.retrieve_array_subset_ndarray::<i8>(&full)
-                .map_err(read)?
-                .into_raw_vec_and_offset()
-                .0,
-        ),
-        "int16" => int64_from(
-            arr.retrieve_array_subset_ndarray::<i16>(&full)
-                .map_err(read)?
-                .into_raw_vec_and_offset()
-                .0,
-        ),
-        "int32" => int64_from(
-            arr.retrieve_array_subset_ndarray::<i32>(&full)
-                .map_err(read)?
-                .into_raw_vec_and_offset()
-                .0,
-        ),
-        "uint8" => int64_from(
-            arr.retrieve_array_subset_ndarray::<u8>(&full)
-                .map_err(read)?
-                .into_raw_vec_and_offset()
-                .0,
-        ),
-        "uint16" => int64_from(
-            arr.retrieve_array_subset_ndarray::<u16>(&full)
-                .map_err(read)?
-                .into_raw_vec_and_offset()
-                .0,
-        ),
-        "uint32" => int64_from(
-            arr.retrieve_array_subset_ndarray::<u32>(&full)
-                .map_err(read)?
-                .into_raw_vec_and_offset()
-                .0,
-        ),
+        "float64" => {
+            CoordValues::Float64(arr.retrieve_array_subset::<Vec<f64>>(&full).map_err(read)?)
+        }
+        "int8" => int64_from(arr.retrieve_array_subset::<Vec<i8>>(&full).map_err(read)?),
+        "int16" => int64_from(arr.retrieve_array_subset::<Vec<i16>>(&full).map_err(read)?),
+        "int32" => int64_from(arr.retrieve_array_subset::<Vec<i32>>(&full).map_err(read)?),
+        "uint8" => int64_from(arr.retrieve_array_subset::<Vec<u8>>(&full).map_err(read)?),
+        "uint16" => int64_from(arr.retrieve_array_subset::<Vec<u16>>(&full).map_err(read)?),
+        "uint32" => int64_from(arr.retrieve_array_subset::<Vec<u32>>(&full).map_err(read)?),
         // int64 and anything else fall back to i64.
-        _ => CoordValues::Int64(
-            arr.retrieve_array_subset_ndarray::<i64>(&full)
-                .map_err(read)?
-                .into_raw_vec_and_offset()
-                .0,
-        ),
+        _ => CoordValues::Int64(arr.retrieve_array_subset::<Vec<i64>>(&full).map_err(read)?),
     })
 }
 

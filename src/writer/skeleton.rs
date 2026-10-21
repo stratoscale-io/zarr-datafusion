@@ -46,9 +46,9 @@ pub enum WriteDataType {
 impl WriteDataType {
     fn to_zarrs(self) -> DataType {
         match self {
-            Self::Int64 => DataType::Int64,
-            Self::Float32 => DataType::Float32,
-            Self::Float64 => DataType::Float64,
+            Self::Int64 => zarrs::array::data_type::int64(),
+            Self::Float32 => zarrs::array::data_type::float32(),
+            Self::Float64 => zarrs::array::data_type::float64(),
         }
     }
 
@@ -318,8 +318,8 @@ pub fn create_skeleton(store_path: &str, spec: &SkeletonSpec) -> Result<(), BoxE
         array.store_metadata()?;
 
         match &coord.values {
-            CoordValues::Int64(v) => array.store_chunk_elements(&[0], v)?,
-            CoordValues::Float64(v) => array.store_chunk_elements(&[0], v)?,
+            CoordValues::Int64(v) => array.store_chunk(&[0], v.as_slice())?,
+            CoordValues::Float64(v) => array.store_chunk(&[0], v.as_slice())?,
         }
         debug!(coord = %coord.name, len, "Coordinate array written");
     }

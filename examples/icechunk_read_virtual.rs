@@ -16,7 +16,7 @@ use icechunk::repository::VersionInfo;
 use icechunk::virtual_chunks::VirtualChunkContainer;
 use icechunk::{ObjectStoreConfig, Repository, RepositoryConfig};
 use zarrs::array::Array;
-use zarrs::array_subset::ArraySubset;
+use zarrs::array::ArraySubset;
 use zarrs_icechunk::AsyncIcechunkStore;
 
 #[tokio::main]
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // .nc file and decode the HDF5 chunk payload.
     let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
     let data = arr
-        .async_retrieve_array_subset_ndarray::<f64>(&subset)
+        .async_retrieve_array_subset::<ndarray::ArrayD<f64>>(&subset)
         .await?;
     println!("read ndim={} shape={:?}", data.ndim(), data.shape());
 

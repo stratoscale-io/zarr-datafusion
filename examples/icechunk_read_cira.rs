@@ -24,8 +24,7 @@ use icechunk::repository::VersionInfo;
 use icechunk::storage::{new_gcs_storage, GcsCredentials, S3Credentials};
 use icechunk::virtual_chunks::VirtualChunkContainer;
 use icechunk::{ObjectStoreConfig, Repository, RepositoryConfig};
-use zarrs::array::{Array, DataType};
-use zarrs::array_subset::ArraySubset;
+use zarrs::array::{data_type, Array, ArraySubset};
 use zarrs::node::Node;
 use zarrs_icechunk::AsyncIcechunkStore;
 
@@ -117,27 +116,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // t2 is very likely float32; handle both f32/f64 so a dtype surprise doesn't
     // force a re-run over the network.
-    let (values, min, max): (Vec<f64>, f64, f64) = match arr.data_type() {
-        DataType::Float32 => {
-            let v = arr
-                .async_retrieve_array_subset_ndarray::<f32>(&subset)
-                .await?;
-            let vals: Vec<f64> = v.iter().map(|x| *x as f64).collect();
-            let (mn, mx) = min_max(&vals);
-            (vals, mn, mx)
-        }
-        DataType::Float64 => {
-            let v = arr
-                .async_retrieve_array_subset_ndarray::<f64>(&subset)
-                .await?;
-            let vals: Vec<f64> = v.iter().copied().collect();
-            let (mn, mx) = min_max(&vals);
-            (vals, mn, mx)
-        }
-        other => {
-            return Err(format!("unexpected t2 dtype: {other}").into());
-        }
+    let dtype = arr.data_type();
+    let values: Vec<f64> = if *dtype == data_type::float32() {
+        let v = arr.async_retrieve_array_subset::<Vec<f32>>(&subset).await?;
+        v.into_iter().map(f64::from).collect()
+    } else if *dtype == data_type::float64() {
+        arr.async_retrieve_array_subset::<Vec<f64>>(&subset).await?
+    } else {
+        return Err(format!("unexpected t2 dtype: {dtype}").into());
     };
+    let (min, max) = min_max(&values);
 
     println!("Read {} values.", values.len());
     let preview: Vec<f64> = values.iter().take(8).copied().collect();
