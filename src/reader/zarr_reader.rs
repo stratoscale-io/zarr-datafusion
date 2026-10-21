@@ -27,6 +27,7 @@ use super::filter::{
     match_ranges_to_data_var, resolve_coord_selection, CoordFilters, CoordSelection,
     CoordValuesRef,
 };
+use super::scan_cache::ScanCache;
 use super::schema_inference::discover_arrays;
 use super::stats::SharedIoStats;
 use super::tracked_store::TrackedStore;
@@ -1872,6 +1873,7 @@ use zarrs_object_store::object_store::path::Path as ObjectPath;
 /// Async twin of [`BatchCtx`]: constant context for [`build_batch_async`].
 struct AsyncBatchCtx<'a> {
     store: &'a AsyncReadableListableStorage,
+    cache: &'a ScanCache,
     prefix: &'a ObjectPath,
     store_meta: &'a ZarrStoreMeta,
     schema: &'a SchemaRef,
@@ -1930,9 +1932,7 @@ async fn build_batch_async(
             } else {
                 format!("/{}/{}", ctx.prefix, field_name)
             };
-            let arr = Array::async_open(ctx.store.clone(), &array_path)
-                .await
-                .map_err(zarr_err)?;
+            let arr = ctx.cache.array(ctx.store, &array_path).await?;
             let data_var_shape = arr.shape();
             let data_var_chunks: Option<Vec<u64>> = ctx
                 .store_meta
@@ -1992,6 +1992,7 @@ async fn build_batch_async(
 /// window via async reads, on demand.
 struct AsyncWindowedScan {
     store: AsyncReadableListableStorage,
+    cache: Arc<ScanCache>,
     prefix: ObjectPath,
     store_meta: ZarrStoreMeta,
     schema: SchemaRef,
@@ -2089,6 +2090,7 @@ impl AsyncWindowedScan {
 
         let ctx = AsyncBatchCtx {
             store: &self.store,
+            cache: &self.cache,
             prefix: &self.prefix,
             store_meta: &self.store_meta,
             schema: &self.schema,
@@ -2141,6 +2143,8 @@ pub async fn read_zarr_async(
     // Rule-set memory budget in bytes (Phase 5); `None` => ZARR_MEM_BUDGET_BYTES,
     // then batch_size. Converted to a row target by the reader's own row_width.
     stream_budget_bytes: Option<u64>,
+    // Shared by the partitions of one scan, which read the same arrays.
+    cache: Arc<ScanCache>,
 ) -> Result<SendableRecordBatchStream> {
     info!("Starting async Zarr read");
 
@@ -2188,55 +2192,63 @@ pub async fn read_zarr_async(
     let outer_slice_idx = partition_selection
         .as_ref()
         .and_then(|_| identify_outer_coord(&store_meta));
-    let mut outer_extract_sel: Option<CoordSelection> = None;
 
     // First, load all coordinate values (needed for filter matching)
     debug!("Loading coordinate values for filter matching");
-    let mut all_coord_values: Vec<CoordValues> = Vec::new();
-
-    for (i, (coord, dtype)) in store_meta.coords.iter().zip(coord_types.iter()).enumerate() {
-        let read_start = Instant::now();
-        let array_path = if prefix.as_ref().is_empty() {
-            format!("/{}", coord.name)
-        } else {
-            format!("/{}/{}", prefix, coord.name)
-        };
-
-        let arr = Array::async_open(store.clone(), &array_path)
-            .await
-            .map_err(zarr_err)?;
-
-        let element_bytes = dtype_to_bytes(dtype);
-        let (raw_values, read_len) = if Some(i) == outer_slice_idx {
-            let sel = partition_selection
-                .as_ref()
-                .expect("outer_slice_idx implies Some");
-            let (rs, re, extract_sel) = plan_outer_coord_read(sel);
-            outer_extract_sel = Some(extract_sel);
-            let subset = ArraySubset::new_with_ranges(std::slice::from_ref(&(rs..re)));
-            (
-                read_coord_values!(async, arr, &subset, dtype.as_str()),
-                (re - rs) as usize,
-            )
-        } else {
-            let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
-            (
-                read_coord_values!(async, arr, &subset, dtype.as_str()),
-                coord.shape[0] as usize,
-            )
-        };
-
-        // Apply CF time conversion using helper function
-        let values =
-            apply_cf_time_conversion(raw_values, coord.cf_time_attrs.as_ref(), &coord.name);
-
-        debug!(path = %array_path, "Coordinate values loaded");
-        if let Some(ref s) = stats {
-            let bytes = read_len as u64 * element_bytes;
-            s.record_coord(bytes, read_start.elapsed());
-        }
-        all_coord_values.push(values);
-    }
+    let outer_read = outer_slice_idx.map(|i| {
+        let sel = partition_selection
+            .as_ref()
+            .expect("outer_slice_idx implies Some");
+        (i, plan_outer_coord_read(sel))
+    });
+    let all_coord_values: Vec<CoordValues> = futures::future::try_join_all(
+        store_meta
+            .coords
+            .iter()
+            .zip(coord_types.iter())
+            .enumerate()
+            .map(|(i, (coord, dtype))| {
+                let (store, cache, stats) = (&store, &cache, &stats);
+                let outer_read = outer_read.as_ref().filter(|(o, _)| *o == i);
+                async move {
+                    let array_path = if prefix.as_ref().is_empty() {
+                        format!("/{}", coord.name)
+                    } else {
+                        format!("/{}/{}", prefix, coord.name)
+                    };
+                    let arr = &cache.array(store, &array_path).await?;
+                    let read = |subset: ArraySubset, read_len: usize| async move {
+                        let read_start = Instant::now();
+                        let raw_values = read_coord_values!(async, arr, &subset, dtype.as_str());
+                        if let Some(s) = stats {
+                            let bytes = read_len as u64 * dtype_to_bytes(dtype);
+                            s.record_coord(bytes, read_start.elapsed());
+                        }
+                        Ok::<_, DataFusionError>(apply_cf_time_conversion(
+                            raw_values,
+                            coord.cf_time_attrs.as_ref(),
+                            &coord.name,
+                        ))
+                    };
+                    match outer_read {
+                        Some((_, (rs, re, _))) => {
+                            let subset =
+                                ArraySubset::new_with_ranges(std::slice::from_ref(&(*rs..*re)));
+                            read(subset, (re - rs) as usize).await
+                        }
+                        None => {
+                            let subset = ArraySubset::new_with_shape(arr.shape().to_vec());
+                            cache
+                                .coord(&array_path, || read(subset, coord.shape[0] as usize))
+                                .await
+                        }
+                    }
+                }
+            }),
+    )
+    .await?;
+    let outer_extract_sel: Option<CoordSelection> =
+        outer_read.map(|(_, (_, _, extract_sel))| extract_sel);
 
     // Calculate coordinate ranges based on filters
     let coord_ranges = if let Some(ref filters) = coord_filters {
@@ -2464,6 +2476,7 @@ pub async fn read_zarr_async(
         .map_err(|inf| DataFusionError::ResourcesExhausted(inf.to_string()))?;
         let ctx = AsyncBatchCtx {
             store: &store,
+            cache: &cache,
             prefix,
             store_meta: &store_meta,
             schema: &schema,
@@ -2503,6 +2516,7 @@ pub async fn read_zarr_async(
         batch_size,
         pending: std::collections::VecDeque::new(),
         store,
+        cache,
         prefix: prefix.clone(),
         store_meta,
         schema,
@@ -3121,10 +3135,71 @@ mod async_streaming_tests {
             Vec::new(),
             batch_size,
             None,
+            Arc::default(),
         )
         .await
         .unwrap();
         stream.try_collect().await.unwrap()
+    }
+
+    /// Each one-step time partition, read concurrently through `cache`.
+    async fn read_partitions(
+        cache: impl Fn() -> Arc<ScanCache>,
+        stats: SharedIoStats,
+    ) -> Vec<RecordBatch> {
+        let (schema, meta) =
+            crate::reader::schema_inference::infer_schema_with_meta(STORE).unwrap();
+        let schema = Arc::new(schema);
+        let (store, prefix) = local_async_store();
+        let partitions = (0..7).map(|t| {
+            let (store, prefix, schema, meta) =
+                (store.clone(), prefix.clone(), schema.clone(), meta.clone());
+            let (stats, cache) = (stats.clone(), cache());
+            async move {
+                let stream = read_zarr_async(
+                    store,
+                    &prefix,
+                    schema,
+                    None,
+                    None,
+                    Some(stats),
+                    Some(meta),
+                    None,
+                    Some(CoordSelection::Range(t, t + 1)),
+                    Vec::new(),
+                    10_000_000,
+                    None,
+                    cache,
+                )
+                .await?;
+                stream.try_collect::<Vec<_>>().await
+            }
+        });
+        futures::future::try_join_all(partitions)
+            .await
+            .unwrap()
+            .concat()
+    }
+
+    #[tokio::test]
+    async fn partitions_sharing_a_cache_read_the_inner_coordinates_once() {
+        let coord_reads = |stats: &SharedIoStats| {
+            stats
+                .coord_arrays
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let alone = Arc::new(ZarrIoStats::default());
+        let reference = read_partitions(Arc::default, alone.clone()).await;
+        let shared = Arc::new(ZarrIoStats::default());
+        let cache = Arc::new(ScanCache::default());
+        let batches = read_partitions(|| cache.clone(), shared.clone()).await;
+
+        // time, lat and lon for each of the 7 partitions, or lat and lon once
+        // and each partition's own time step.
+        assert_eq!(coord_reads(&alone), 21);
+        assert_eq!(coord_reads(&shared), 2 + 7);
+        assert_eq!(rows(&batches), 700);
+        assert_eq!(rendered(&batches), rendered(&reference));
     }
 
     fn rows(batches: &[RecordBatch]) -> usize {
