@@ -44,6 +44,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(GCS_PREFIX.to_string()),
         Some(GcsCredentials::Anonymous),
         None,
+        vec![],
+        vec![],
     )?;
     println!("Opened anonymous GCS storage gs://{GCS_BUCKET}/{GCS_PREFIX}/");
 
@@ -72,7 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         S3_VIRTUAL_CONTAINER.to_string(),
         Some(Credentials::S3(S3Credentials::Anonymous)),
     )]);
-    let repo = Repository::open(Some(config), storage, authorize).await?;
+    let repo = Repository::open(storage)
+        .config(config)
+        .authorize_virtual_chunk_access(authorize)
+        .execute()
+        .await?;
     let session = repo
         .readonly_session(&VersionInfo::BranchTipRef("main".to_string()))
         .await?;

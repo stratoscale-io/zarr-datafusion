@@ -30,7 +30,7 @@ zarrs_object_store = { version = "0.6", features = ["gcp", "aws", "http"] }
 # backend set: local fs (synthetic spike), GCS (the repo lives there), and S3
 # (virtual HDF5 chunks on noaa-oar-mlwp-data) — avoiding the heavy aws-sdk `s3`
 # and azure/http backends.
-icechunk = { version = "2.0.1", default-features = false, features = ["object-store-fs", "object-store-gcs", "object-store-s3"], optional = true }
+icechunk = { version = "2.3", default-features = false, features = ["object-store-fs", "object-store-gcs", "object-store-s3"], optional = true }
 zarrs_icechunk = { version = "0.5", default-features = false, optional = true }
 parquet = { version = "58", default-features = false, features = ["arrow", "async"] }
 glob = "0.3"
