@@ -121,7 +121,8 @@ impl TaskEstimator for ZarrTaskEstimator {
                         exec.coord_filters().cloned(),
                         None,
                     )
-                    .with_partitions(group),
+                    .with_partitions(group)
+                    .with_store_kind(exec.store_kind().clone()),
                 ) as Arc<dyn ExecutionPlan>
             });
 

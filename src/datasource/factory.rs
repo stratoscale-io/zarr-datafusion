@@ -43,6 +43,7 @@ async fn build_icechunk_table(
     store: zarrs::storage::AsyncReadableListableStorage,
 ) -> Result<Arc<dyn TableProvider>> {
     let group = table_option(options, "group");
+    let anonymous = icechunk_anonymous(options);
     let prefix = match group {
         Some(g) => ObjectPath::from(g.trim_matches('/')),
         None => ObjectPath::default(),
@@ -69,8 +70,15 @@ async fn build_icechunk_table(
         "Icechunk table created successfully"
     );
     Ok(Arc::new(ZarrTable::with_cached_icechunk(
-        schema, location, store, prefix, metadata,
+        schema, location, store, prefix, metadata, anonymous,
     )))
+}
+
+#[cfg(feature = "icechunk")]
+fn icechunk_anonymous(options: &std::collections::HashMap<String, String>) -> bool {
+    table_option(options, "anonymous")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
+        .unwrap_or(true)
 }
 
 #[async_trait]
@@ -107,15 +115,12 @@ impl TableProviderFactory for ZarrTableFactory {
             #[cfg(feature = "icechunk")]
             if crate::reader::icechunk_store::is_icechunk_store_async(&store, &prefix).await {
                 info!("Remote icechunk store detected");
-                let anonymous = table_option(&cmd.options, "anonymous")
-                    .map(|v| {
-                        !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no")
-                    })
-                    .unwrap_or(true);
-                let ic_store =
-                    crate::reader::icechunk_store::open_icechunk_remote(&cmd.location, anonymous)
-                        .await
-                        .map_err(DataFusionError::External)?;
+                let ic_store = crate::reader::icechunk_store::open_icechunk_remote(
+                    &cmd.location,
+                    icechunk_anonymous(&cmd.options),
+                )
+                .await
+                .map_err(DataFusionError::External)?;
                 return build_icechunk_table(&cmd.location, &cmd.options, ic_store).await;
             }
 
