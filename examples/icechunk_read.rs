@@ -10,7 +10,6 @@
 //!     scripts/gen_synthetic_icechunk.py data/synthetic.icechunk
 //! Then:
 //!   cargo run --features icechunk --example icechunk_read -- data/synthetic.icechunk
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use icechunk::repository::VersionInfo;
@@ -27,7 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Opening local icechunk repo at {path}");
 
     let storage = new_local_filesystem_storage(std::path::Path::new(&path)).await?;
-    let repo = Repository::open(Some(RepositoryConfig::default()), storage, HashMap::new()).await?;
+    let repo = Repository::open(storage)
+        .config(RepositoryConfig::default())
+        .execute()
+        .await?;
     let session = repo
         .readonly_session(&VersionInfo::BranchTipRef("main".to_string()))
         .await?;
