@@ -10,7 +10,7 @@ use zarrs::storage::AsyncReadableListableStorage;
 use zarrs_object_store::object_store::path::Path as ObjectPath;
 
 use crate::physical_plan::partition::{plan_partitions, split_selection, PartitionSpec};
-use crate::physical_plan::zarr_exec::ZarrExec;
+use crate::physical_plan::zarr_exec::{StoreKind, ZarrExec};
 use crate::reader::filter::{is_date_part_filter, parse_coord_filters, CoordFilters, CoordSelection};
 use crate::reader::schema_inference::{ZarrArrayMeta, ZarrStoreMeta};
 use crate::reader::storage::is_remote_url;
@@ -34,6 +34,8 @@ pub struct ZarrTable {
     store_meta: Option<ZarrStoreMeta>,
     /// Cached VirtualiZarr adapter for remote VirtualiZarr stores
     cached_virtualizarr: CachedVirtualiZarrAdapter,
+    /// How a scan reopens the store when it has no cached one, as on a worker.
+    store_kind: StoreKind,
 }
 
 impl std::fmt::Debug for ZarrTable {
@@ -65,6 +67,7 @@ impl ZarrTable {
             cached_remote: None,
             store_meta: None,
             cached_virtualizarr: None,
+            store_kind: StoreKind::Zarr,
         }
     }
 
@@ -80,6 +83,7 @@ impl ZarrTable {
             cached_remote: None,
             store_meta: Some(metadata),
             cached_virtualizarr: None,
+            store_kind: StoreKind::Zarr,
         }
     }
 
@@ -97,6 +101,7 @@ impl ZarrTable {
             cached_remote: Some((store, prefix, metadata.clone())),
             store_meta: Some(metadata),
             cached_virtualizarr: None,
+            store_kind: StoreKind::Zarr,
         }
     }
 
@@ -113,6 +118,7 @@ impl ZarrTable {
             cached_remote: None,
             store_meta: Some(metadata),
             cached_virtualizarr: Some(adapter),
+            store_kind: StoreKind::Zarr,
         }
     }
 
@@ -122,19 +128,23 @@ impl ZarrTable {
     /// `prefix`, which is the group path within the repo, or root) so schema
     /// inference, partition planning and the async read path treat it like any
     /// other remote store.
+    /// Its scans carry how to reopen the repo.
     pub fn with_cached_icechunk(
         schema: SchemaRef,
         path: impl Into<String>,
         store: AsyncReadableListableStorage,
         prefix: ObjectPath,
         metadata: ZarrStoreMeta,
+        anonymous: bool,
     ) -> Self {
+        let group = (!prefix.as_ref().is_empty()).then(|| prefix.to_string());
         Self {
             schema,
             path: path.into(),
             cached_remote: Some((store, prefix, metadata.clone())),
             store_meta: Some(metadata),
             cached_virtualizarr: None,
+            store_kind: StoreKind::Icechunk { group, anonymous },
         }
     }
 
@@ -484,7 +494,8 @@ impl TableProvider for ZarrTable {
         // FILL 6d: attach the planned slices (builder consumes & returns exec).
         let exec = exec
             .with_partitions(partitions)
-            .with_store_meta(self.store_meta.clone());
+            .with_store_meta(self.store_meta.clone())
+            .with_store_kind(self.store_kind.clone());
 
         Ok(Arc::new(exec))
     }

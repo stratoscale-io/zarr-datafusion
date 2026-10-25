@@ -8,11 +8,11 @@
 //! on both sides via `configure_distributed_builder` (see `crate::distributed`).
 //!
 //! Only the *logical* inputs of `ZarrExec` are serialized: `schema`, `path`,
-//! `projection`, `limit`, and `coord_filters`. The live store caches
-//! (`cached_remote`, `cached_virtualizarr`), the derived `PlanProperties`, and
-//! the runtime `io_stats` are intentionally dropped — `ZarrExec::execute()`
-//! re-creates the store from `path` when the caches are absent, which is
-//! exactly the right behavior on a remote worker.
+//! `projection`, `limit`, `coord_filters`, `partitions` and `store_kind`. The
+//! live store caches (`cached_remote`, `cached_virtualizarr`), the derived
+//! `PlanProperties`, and the runtime `io_stats` are intentionally dropped —
+//! `ZarrExec::execute()` re-creates the store from `path` and `store_kind` when
+//! the caches are absent, which is exactly the right behavior on a remote worker.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::datasource::zarr::ZarrTable;
 use crate::physical_plan::partition::PartitionSpec;
-use crate::physical_plan::zarr_exec::ZarrExec;
+use crate::physical_plan::zarr_exec::{StoreKind, ZarrExec};
 use crate::reader::filter::{CoordFilterKind, CoordFilters};
 use crate::reader::schema_inference::ZarrStoreMeta;
 
@@ -167,6 +167,8 @@ struct ZarrExecDto {
     /// as an empty (single-partition) list.
     #[serde(default)]
     partitions: Vec<PartitionSpec>,
+    #[serde(default)]
+    store_kind: StoreKind,
 }
 
 impl ZarrExecDto {
@@ -194,6 +196,7 @@ impl ZarrExecDto {
             limit: exec.limit(),
             coord_filters,
             partitions: exec.partitions().to_vec(),
+            store_kind: exec.store_kind().clone(),
         })
     }
 
@@ -217,7 +220,8 @@ impl ZarrExecDto {
             })
             .transpose()?;
 
-        // Caches are dropped on the wire; execute() re-creates the store from `path`.
+        // Caches are dropped on the wire; execute() re-creates the store from
+        // `path` and `store_kind`.
         // Reattach the partition slices so the decoded exec reports the right
         // partition count and execute() reads only this task's chunks.
         Ok(ZarrExec::new(
@@ -229,7 +233,8 @@ impl ZarrExecDto {
             coord_filters,
             None,
         )
-        .with_partitions(self.partitions))
+        .with_partitions(self.partitions)
+        .with_store_kind(self.store_kind))
     }
 }
 
@@ -482,6 +487,72 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn roundtrip_preserves_store_kind() {
+        let kinds = [
+            StoreKind::Zarr,
+            StoreKind::Icechunk {
+                group: Some("single/spatial".to_string()),
+                anonymous: true,
+            },
+            StoreKind::Icechunk {
+                group: None,
+                anonymous: false,
+            },
+        ];
+        for kind in kinds {
+            let exec = ZarrExec::new(
+                sample_schema(),
+                "s3://bucket/repo".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .with_store_kind(kind.clone());
+            let codec = ZarrPhysicalCodec;
+            let mut buf = Vec::new();
+            codec
+                .try_encode(Arc::new(exec) as Arc<dyn ExecutionPlan>, &mut buf)
+                .unwrap();
+            let decoded = codec
+                .try_decode(&buf, &[], &TaskContext::default())
+                .unwrap();
+            assert_eq!(
+                decoded.downcast_ref::<ZarrExec>().unwrap().store_kind(),
+                &kind
+            );
+        }
+    }
+
+    #[test]
+    fn payload_without_store_kind_is_plain_zarr() {
+        let dto = ZarrExecDto::from_exec(&ZarrExec::new(
+            sample_schema(),
+            "/tmp/local.zarr".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+        let mut json = serde_json::to_value(&dto).unwrap();
+        json.as_object_mut().unwrap().remove("store_kind");
+        let decoded = ZarrPhysicalCodec
+            .try_decode(
+                &serde_json::to_vec(&json).unwrap(),
+                &[],
+                &TaskContext::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            decoded.downcast_ref::<ZarrExec>().unwrap().store_kind(),
+            &StoreKind::Zarr
+        );
     }
 
     #[test]

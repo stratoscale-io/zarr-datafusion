@@ -10,11 +10,14 @@
 
 use std::sync::Arc;
 
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use zarr_datafusion::datasource::factory::ZarrTableFactory;
 use zarr_datafusion::optimizer::{CountStatisticsRule, MinMaxStatisticsRule};
+use zarr_datafusion::physical_plan::codec::ZarrPhysicalCodec;
 use zarr_datafusion::physical_plan::zarr_exec::ZarrExec;
 
 const STORE: &str = "data/synthetic.icechunk";
@@ -210,6 +213,52 @@ async fn formatted(ctx: &SessionContext, sql: &str) -> String {
     arrow::util::pretty::pretty_format_batches(&batches)
         .unwrap()
         .to_string()
+}
+
+
+/// `plan` with each scan sent through the codec, as a worker receives it:
+/// without the store the head opened.
+fn shipped(ctx: &SessionContext, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    plan.transform_down(|node| {
+        if node.downcast_ref::<ZarrExec>().is_none() {
+            return Ok(Transformed::no(node));
+        }
+        let mut buf = Vec::new();
+        ZarrPhysicalCodec.try_encode(node, &mut buf)?;
+        let decoded = ZarrPhysicalCodec.try_decode(&buf, &[], &ctx.task_ctx())?;
+        Ok(Transformed::yes(decoded))
+    })
+    .unwrap()
+    .data
+}
+
+#[tokio::test]
+async fn shipped_scan_reopens_the_icechunk_store() {
+    let ctx = ctx();
+    register(&ctx).await;
+    for sql in [
+        "SELECT COUNT(temperature), SUM(temperature) FROM syn",
+        "SELECT temperature FROM syn WHERE time = 3 AND lat = -10.0 AND lon = 180.0",
+    ] {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let want = collect(plan.clone(), ctx.task_ctx()).await.unwrap();
+        let got = collect(shipped(&ctx, plan), ctx.task_ctx()).await.unwrap();
+        assert_eq!(
+            arrow::util::pretty::pretty_format_batches(&got)
+                .unwrap()
+                .to_string(),
+            arrow::util::pretty::pretty_format_batches(&want)
+                .unwrap()
+                .to_string(),
+            "{sql}"
+        );
+    }
 }
 
 // ==================== remote CIRA (network-gated) ====================
