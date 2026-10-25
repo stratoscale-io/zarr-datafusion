@@ -1,5 +1,6 @@
 use crate::physical_plan::partition::PartitionSpec;
 use crate::reader::filter::{CoordFilters, CoordSelection};
+use crate::reader::scan_cache::ScanCache;
 use crate::reader::schema_inference::ZarrStoreMeta;
 use crate::reader::stats::{SharedIoStats, ZarrIoStats};
 use crate::reader::storage::is_remote_url;
@@ -69,6 +70,8 @@ pub struct ZarrExec {
     /// callers that don't supply it (codec/tests) — recognition then declines.
     store_meta: Option<ZarrStoreMeta>,
     store_kind: StoreKind,
+    /// Shared by this scan's partitions; a new scan starts with an empty one.
+    scan_cache: Arc<ScanCache>,
 }
 
 impl std::fmt::Debug for ZarrExec {
@@ -147,6 +150,7 @@ impl ZarrExec {
             stream_budget_bytes: None,
             store_meta: None,
             store_kind: StoreKind::Zarr,
+            scan_cache: Arc::default(),
         }
     }
 
@@ -367,6 +371,7 @@ impl ExecutionPlan for ZarrExec {
                 self.coord_filters.clone(),
                 batch_size,
                 stream_budget_bytes,
+                self.scan_cache.clone(),
             );
         }
 
@@ -381,6 +386,7 @@ impl ExecutionPlan for ZarrExec {
                 self.coord_filters.clone(),
                 batch_size,
                 stream_budget_bytes,
+                self.scan_cache.clone(),
             )
         } else if is_remote_url(&self.path)
             || self.cached_remote.is_some()
@@ -401,6 +407,7 @@ impl ExecutionPlan for ZarrExec {
                 partition_extra,
                 batch_size,
                 stream_budget_bytes,
+                self.scan_cache.clone(),
             )
         } else {
             info!("Using local (sync) execution path");
@@ -458,6 +465,7 @@ struct AsyncReadParams {
     batch_size: usize,
     /// Rule-set streaming row target (Phase 5); `None` => env/batch_size fallback.
     stream_budget_bytes: Option<u64>,
+    cache: Arc<ScanCache>,
 }
 
 /// Execute an async read with the given store setup function.
@@ -507,6 +515,7 @@ where
             params.partition_extra,
             params.batch_size,
             params.stream_budget_bytes,
+            params.cache,
         )
         .await?;
 
@@ -538,6 +547,7 @@ fn execute_remote(
     partition_extra: Vec<(usize, CoordSelection)>,
     batch_size: usize,
     stream_budget_bytes: Option<u64>,
+    cache: Arc<ScanCache>,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     use crate::reader::async_tracked_store::AsyncTrackedStore;
     use crate::reader::storage::create_async_store;
@@ -560,6 +570,7 @@ fn execute_remote(
         partition_extra,
         batch_size,
         stream_budget_bytes,
+        cache,
     };
 
     execute_async_read(
@@ -629,6 +640,7 @@ fn execute_virtualizarr(
     coord_filters: Option<CoordFilters>,
     batch_size: usize,
     stream_budget_bytes: Option<u64>,
+    cache: Arc<ScanCache>,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     use crate::reader::schema_inference::discover_arrays;
 
@@ -648,6 +660,7 @@ fn execute_virtualizarr(
         partition_extra: Vec::new(),
         batch_size,
         stream_budget_bytes,
+        cache,
     };
 
     execute_async_read(
@@ -674,6 +687,7 @@ fn execute_virtualizarr_with_adapter(
     coord_filters: Option<CoordFilters>,
     batch_size: usize,
     stream_budget_bytes: Option<u64>,
+    cache: Arc<ScanCache>,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     debug!("Setting up remote VirtualiZarr execution with cached adapter");
 
@@ -687,6 +701,7 @@ fn execute_virtualizarr_with_adapter(
         partition_extra: Vec::new(),
         batch_size,
         stream_budget_bytes,
+        cache,
     };
 
     execute_async_read(

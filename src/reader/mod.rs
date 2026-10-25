@@ -6,6 +6,7 @@ pub mod filter;
 #[cfg(feature = "icechunk")]
 pub mod icechunk_store;
 pub mod parquet_refs;
+pub mod scan_cache;
 pub mod schema_inference;
 pub mod stats;
 pub mod storage;
