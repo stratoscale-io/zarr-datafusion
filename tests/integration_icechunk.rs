@@ -11,15 +11,23 @@
 use std::sync::Arc;
 
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::prelude::SessionContext;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use zarr_datafusion::datasource::factory::ZarrTableFactory;
 use zarr_datafusion::optimizer::{CountStatisticsRule, MinMaxStatisticsRule};
+use zarr_datafusion::physical_plan::zarr_exec::ZarrExec;
 
 const STORE: &str = "data/synthetic.icechunk";
 
 /// A SessionContext wired like the CLI: ZARR table factory + the stat optimizer rules.
 fn ctx() -> SessionContext {
+    ctx_with_target(SessionConfig::new().target_partitions())
+}
+
+/// Like `ctx`, with scans targeting `n`-way parallelism.
+fn ctx_with_target(n: usize) -> SessionContext {
     let state = SessionStateBuilder::new()
+        .with_config(SessionConfig::new().with_target_partitions(n))
         .with_default_features()
         .with_table_factory("ZARR".to_string(), Arc::new(ZarrTableFactory) as _)
         .with_optimizer_rule(Arc::new(CountStatisticsRule::new()))
@@ -137,6 +145,71 @@ async fn value_exact_at_coordinate() {
         .unwrap()
         .value(0);
     assert_eq!(v, 345.0);
+}
+
+fn scan_partitions(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+    match plan.downcast_ref::<ZarrExec>() {
+        Some(zarr) => Some(zarr.partitions().len()),
+        None => plan.children().into_iter().find_map(scan_partitions),
+    }
+}
+
+async fn partitions_for(ctx: &SessionContext, sql: &str) -> usize {
+    let plan = ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    scan_partitions(&plan).expect("plan contains a ZarrExec")
+}
+
+#[tokio::test]
+async fn scan_splits_time_chunks_across_partitions() {
+    let ctx = ctx_with_target(4);
+    register(&ctx).await;
+    // 7 one-step time chunks over 4 partitions.
+    assert_eq!(partitions_for(&ctx, "SELECT temperature FROM syn").await, 4);
+    // The time filter resolves to steps 2..=5 on the head, which are split.
+    assert_eq!(
+        partitions_for(
+            &ctx,
+            "SELECT temperature FROM syn WHERE time >= 2 AND time <= 5"
+        )
+        .await,
+        4
+    );
+}
+
+#[tokio::test]
+async fn partitioned_scan_is_value_transparent() {
+    let queries = [
+        "SELECT COUNT(temperature), SUM(temperature) FROM syn",
+        "SELECT COUNT(temperature), SUM(temperature) FROM syn WHERE time >= 2 AND time <= 5",
+        "SELECT COUNT(temperature), SUM(temperature) FROM syn WHERE time = 3 AND lat = -10.0",
+        "SELECT time, SUM(temperature) FROM syn GROUP BY time ORDER BY time",
+    ];
+    let reference = ctx_with_target(1);
+    register(&reference).await;
+    for target in [3, 8] {
+        let ctx = ctx_with_target(target);
+        register(&ctx).await;
+        for sql in queries {
+            assert_eq!(
+                formatted(&ctx, sql).await,
+                formatted(&reference, sql).await,
+                "{sql} at {target} partitions"
+            );
+        }
+    }
+}
+
+async fn formatted(ctx: &SessionContext, sql: &str) -> String {
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string()
 }
 
 // ==================== remote CIRA (network-gated) ====================

@@ -193,11 +193,10 @@ Commit hashes point at the change that introduced or settled the decision.
   cell).
 - **Trade-offs / current limits:** icechunk performs its own object I/O, so the
   `AsyncTrackedStore` byte stats don't cover these reads (CLI shows 0 disk bytes).
-  Scans stay single-partition (the outer-selection resolver can't drive the cached
-  async store yet). The flatten-to-one-batch model means an unfiltered scan over a
+  The flatten-to-one-batch model means an unfiltered scan over a
   huge cube OOMs — callers must filter every coordinate of the variable they read
   (a query-time cube restriction / streaming-by-variable model is the real fix).
-  Partitioned icechunk scans, non-anonymous credential plumbing beyond a simple
+  Non-anonymous credential plumbing beyond a simple
   flag, and writing remain follow-ups.
 
 ---
