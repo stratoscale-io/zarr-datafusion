@@ -10,7 +10,7 @@ use zarrs::storage::AsyncReadableListableStorage;
 use zarrs_object_store::object_store::path::Path as ObjectPath;
 
 use crate::physical_plan::partition::{plan_partitions, split_selection, PartitionSpec};
-use crate::physical_plan::zarr_exec::ZarrExec;
+use crate::physical_plan::zarr_exec::{StoreKind, ZarrExec};
 use crate::reader::filter::{is_date_part_filter, parse_coord_filters, CoordFilters, CoordSelection};
 use crate::reader::schema_inference::{ZarrArrayMeta, ZarrStoreMeta};
 use crate::reader::storage::is_remote_url;
@@ -34,12 +34,8 @@ pub struct ZarrTable {
     store_meta: Option<ZarrStoreMeta>,
     /// Cached VirtualiZarr adapter for remote VirtualiZarr stores
     cached_virtualizarr: CachedVirtualiZarrAdapter,
-    /// True when the cached store is an icechunk store (local or remote). Icechunk
-    /// reads go through the async path (via `cached_remote`) but the scan stays
-    /// single-partition — the outer-selection resolver can't drive the cached
-    /// async store yet, and for a local icechunk path it would wrongly reopen the
-    /// path as a plain Zarr store.
-    icechunk: bool,
+    /// How a scan reopens the store when it has no cached one, as on a worker.
+    store_kind: StoreKind,
 }
 
 impl std::fmt::Debug for ZarrTable {
@@ -71,7 +67,7 @@ impl ZarrTable {
             cached_remote: None,
             store_meta: None,
             cached_virtualizarr: None,
-            icechunk: false,
+            store_kind: StoreKind::Zarr,
         }
     }
 
@@ -87,7 +83,7 @@ impl ZarrTable {
             cached_remote: None,
             store_meta: Some(metadata),
             cached_virtualizarr: None,
-            icechunk: false,
+            store_kind: StoreKind::Zarr,
         }
     }
 
@@ -105,7 +101,7 @@ impl ZarrTable {
             cached_remote: Some((store, prefix, metadata.clone())),
             store_meta: Some(metadata),
             cached_virtualizarr: None,
-            icechunk: false,
+            store_kind: StoreKind::Zarr,
         }
     }
 
@@ -122,7 +118,7 @@ impl ZarrTable {
             cached_remote: None,
             store_meta: Some(metadata),
             cached_virtualizarr: Some(adapter),
-            icechunk: false,
+            store_kind: StoreKind::Zarr,
         }
     }
 
@@ -130,22 +126,25 @@ impl ZarrTable {
     ///
     /// The icechunk store is parked in the `cached_remote` slot (keyed at
     /// `prefix`, which is the group path within the repo, or root) so schema
-    /// inference and the async read path treat it like any other remote store.
-    /// The `icechunk` marker keeps the scan single-partition.
+    /// inference, partition planning and the async read path treat it like any
+    /// other remote store.
+    /// Its scans carry how to reopen the repo.
     pub fn with_cached_icechunk(
         schema: SchemaRef,
         path: impl Into<String>,
         store: AsyncReadableListableStorage,
         prefix: ObjectPath,
         metadata: ZarrStoreMeta,
+        anonymous: bool,
     ) -> Self {
+        let group = (!prefix.as_ref().is_empty()).then(|| prefix.to_string());
         Self {
             schema,
             path: path.into(),
             cached_remote: Some((store, prefix, metadata.clone())),
             store_meta: Some(metadata),
             cached_virtualizarr: None,
-            icechunk: true,
+            store_kind: StoreKind::Icechunk { group, anonymous },
         }
     }
 
@@ -191,14 +190,6 @@ impl ZarrTable {
             return Vec::new();
         }
 
-        // Guard 1b: icechunk stores (local or remote) stay single-partition for
-        // now — the outer-selection resolver can't drive the cached async store
-        // yet, and for a local icechunk path the sync branch below would wrongly
-        // reopen `self.path` as a plain Zarr store.
-        if self.icechunk {
-            return Vec::new();
-        }
-
         // Guard 2: we need metadata and a data variable to size the outer axis.
         let Some(meta) = &self.store_meta else {
             return Vec::new();
@@ -227,19 +218,18 @@ impl ZarrTable {
             .unwrap_or(outer_len);
 
         // Resolve the outer filter on the head (reads only the outer coord, and
-        // only when an outer filter exists). Remote stores resolve via the cached
-        // async store the head set up; workers never reach here.
-        let outer = if is_remote_url(&self.path) {
-            match &self.cached_remote {
-                Some((store, prefix, _)) => {
-                    resolve_outer_selection_async(store.clone(), prefix, meta, coord_filters).await
-                }
-                // No cached async store on the head (unexpected): fall back to
-                // geometry partitioning rather than building a store here.
-                None => Ok(OuterSelection::Unfiltered),
+        // only when an outer filter exists). Remote and icechunk stores resolve
+        // via the cached async store the head set up; workers never reach here.
+        // A local icechunk path must not reach the sync resolver, which would
+        // open it as a plain Zarr store.
+        let outer = match &self.cached_remote {
+            Some((store, prefix, _)) => {
+                resolve_outer_selection_async(store.clone(), prefix, meta, coord_filters).await
             }
-        } else {
-            resolve_outer_selection(&self.path, meta, coord_filters)
+            // No cached async store on the head (unexpected): fall back to
+            // geometry partitioning rather than building a store here.
+            None if is_remote_url(&self.path) => Ok(OuterSelection::Unfiltered),
+            None => resolve_outer_selection(&self.path, meta, coord_filters),
         };
 
         let outer_specs = match outer {
@@ -504,7 +494,8 @@ impl TableProvider for ZarrTable {
         // FILL 6d: attach the planned slices (builder consumes & returns exec).
         let exec = exec
             .with_partitions(partitions)
-            .with_store_meta(self.store_meta.clone());
+            .with_store_meta(self.store_meta.clone())
+            .with_store_kind(self.store_kind.clone());
 
         Ok(Arc::new(exec))
     }

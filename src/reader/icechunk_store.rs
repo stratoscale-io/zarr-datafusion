@@ -36,8 +36,7 @@ use zarrs_icechunk::AsyncIcechunkStore;
 /// Error opening an icechunk store.
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Default S3 region for a virtual-chunk container that doesn't declare one.
-/// (The NOAA archival bucket CIRA references lives in us-east-1.)
+/// For a repo whose bucket's region can't be resolved.
 const DEFAULT_S3_REGION: &str = "us-east-1";
 
 /// Detect a local icechunk repository by its on-disk layout.
@@ -71,7 +70,10 @@ pub async fn open_icechunk_async(path: &str) -> Result<AsyncReadableListableStor
     let storage = new_local_filesystem_storage(Path::new(path)).await?;
     // Default config: local native + inlined chunks need no virtual-chunk
     // containers or credentials. (Virtual/remote containers arrive in a later phase.)
-    let repo = Repository::open(Some(RepositoryConfig::default()), storage, HashMap::new()).await?;
+    let repo = Repository::open(storage)
+        .config(RepositoryConfig::default())
+        .execute()
+        .await?;
     let session = repo
         .readonly_session(&VersionInfo::BranchTipRef("main".to_string()))
         .await?;
@@ -186,24 +188,28 @@ pub async fn open_icechunk_remote(
             } else {
                 None // FromEnv
             };
-            new_gcs_storage(bucket.clone(), prefix.clone(), creds, None)?
+            new_gcs_storage(bucket.clone(), prefix.clone(), creds, None, vec![], vec![])?
         }
         "s3" => {
+            let region = crate::reader::storage::s3_bucket_region(&bucket)
+                .await
+                .unwrap_or_else(|| DEFAULT_S3_REGION.to_string());
             let opts = S3Options::default()
-                .with_region(DEFAULT_S3_REGION)
+                .with_region(&region)
                 .with_anonymous(anonymous);
             let creds = if anonymous {
                 Some(S3Credentials::Anonymous)
             } else {
                 None
             };
-            new_s3_object_store_storage(opts, bucket.clone(), prefix.clone(), creds).await?
+            new_s3_object_store_storage(opts, bucket.clone(), prefix.clone(), creds, vec![], vec![])
+                .await?
         }
         other => return Err(format!("unsupported icechunk scheme '{other}'").into()),
     };
 
     // Phase 1: open with the persisted config to discover virtual-chunk containers.
-    let repo0 = Repository::open(None, storage.clone(), HashMap::new()).await?;
+    let repo0 = Repository::open(storage.clone()).execute().await?;
 
     // Phase 2: build an override config + authorization map. Copy every persisted
     // container through; for S3 ones, flip `anonymous: true` (the workaround) and
@@ -244,7 +250,11 @@ pub async fn open_icechunk_remote(
         }
     }
 
-    let repo = Repository::open(Some(config), storage, authorize).await?;
+    let repo = Repository::open(storage)
+        .config(config)
+        .authorize_virtual_chunk_access(authorize)
+        .execute()
+        .await?;
     let session = repo
         .readonly_session(&VersionInfo::BranchTipRef("main".to_string()))
         .await?;

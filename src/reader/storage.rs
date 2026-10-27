@@ -6,15 +6,17 @@
 //! - Google Cloud Storage: `gs://bucket/path`
 //! - HTTP/HTTPS: `http://host/path` or `https://host/path`
 
-use std::sync::Arc;
-use tracing::{debug, info, instrument};
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Mutex;
+use tracing::{debug, info, instrument, warn};
 use url::Url;
 use zarrs::storage::AsyncReadableListableStorage;
-use zarrs_object_store::object_store::aws::AmazonS3Builder;
+use zarrs_object_store::object_store::aws::{resolve_bucket_region, AmazonS3Builder};
 use zarrs_object_store::object_store::gcp::GoogleCloudStorageBuilder;
 use zarrs_object_store::object_store::http::HttpBuilder;
 use zarrs_object_store::object_store::path::Path as ObjectPath;
-use zarrs_object_store::object_store::Error as ObjectStoreError;
+use zarrs_object_store::object_store::{ClientOptions, Error as ObjectStoreError};
 use zarrs_object_store::AsyncObjectStore;
 
 /// Error type for storage operations
@@ -150,9 +152,11 @@ async fn create_s3_store(
         .ok_or_else(|| StorageError::InvalidUrl("Missing bucket in S3 URL".to_string()))?;
     let path = parsed.path().trim_start_matches('/');
 
-    let store = AmazonS3Builder::from_env()
-        .with_bucket_name(bucket)
-        .build()?;
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+    if let Some(region) = s3_bucket_region(bucket).await {
+        builder = builder.with_region(region);
+    }
+    let store = builder.build()?;
 
     // Returned untracked: byte counting is attached per-execution in `execute_remote`,
     // because this store is cached across queries while stats are per-query.
@@ -160,6 +164,30 @@ async fn create_s3_store(
     let object_path = ObjectPath::from(path);
 
     Ok((async_store, object_path))
+}
+
+/// The region S3 says `bucket` is in, which the environment's region may not
+/// be. None with a custom endpoint, such as MinIO's, or if S3 can't be asked.
+pub async fn s3_bucket_region(bucket: &str) -> Option<String> {
+    const ENDPOINTS: [&str; 3] = ["AWS_ENDPOINT", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"];
+    if ENDPOINTS.iter().any(|key| std::env::var_os(key).is_some()) {
+        return None;
+    }
+    static REGIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let mut regions = REGIONS.get_or_init(Default::default).lock().await;
+    if let Some(region) = regions.get(bucket) {
+        return Some(region.clone());
+    }
+    match resolve_bucket_region(bucket, &ClientOptions::default()).await {
+        Ok(region) => {
+            regions.insert(bucket.to_string(), region.clone());
+            Some(region)
+        }
+        Err(e) => {
+            warn!(bucket, error = %e, "Couldn't resolve the bucket's region");
+            None
+        }
+    }
 }
 
 /// Create a GCS storage backend

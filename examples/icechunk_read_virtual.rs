@@ -36,12 +36,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ObjectStoreConfig::LocalFileSystem(PathBuf::from("/")),
     )?)?;
     // Local filesystem needs no credentials (None), keyed by the container prefix.
-    let repo = Repository::open(
-        Some(config),
-        storage,
-        HashMap::from([(prefix.clone(), None)]),
-    )
-    .await?;
+    let repo = Repository::open(storage)
+        .config(config)
+        .authorize_virtual_chunk_access(HashMap::from([(prefix.clone(), None)]))
+        .execute()
+        .await?;
     let session = repo
         .readonly_session(&VersionInfo::BranchTipRef("main".to_string()))
         .await?;

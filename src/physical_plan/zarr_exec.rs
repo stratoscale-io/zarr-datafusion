@@ -1,5 +1,6 @@
 use crate::physical_plan::partition::PartitionSpec;
 use crate::reader::filter::{CoordFilters, CoordSelection};
+use crate::reader::scan_cache::ScanCache;
 use crate::reader::schema_inference::ZarrStoreMeta;
 use crate::reader::stats::{SharedIoStats, ZarrIoStats};
 use crate::reader::storage::is_remote_url;
@@ -12,6 +13,7 @@ use datafusion::{
     physical_expr::EquivalenceProperties,
     physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties},
 };
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info};
 use zarrs::storage::AsyncReadableListableStorage;
@@ -22,6 +24,20 @@ pub type CachedRemoteStore = Option<(AsyncReadableListableStorage, ObjectPath, Z
 
 /// Cached VirtualiZarr adapter (pre-loaded refs and metadata)
 pub type CachedVirtualiZarrAdapter = Option<Arc<VirtualStoreAdapter>>;
+
+/// How to reopen a scan's store from its path when no cached store is attached,
+/// as on a worker that decoded the scan.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StoreKind {
+    /// Plain Zarr, or a VirtualiZarr store, told apart by its path.
+    #[default]
+    Zarr,
+    /// An icechunk repository, read at `group` (the root when `None`).
+    Icechunk {
+        group: Option<String>,
+        anonymous: bool,
+    },
+}
 
 #[derive(Clone)]
 pub struct ZarrExec {
@@ -53,6 +69,9 @@ pub struct ZarrExec {
     /// extents. Used by the aggregate-pushdown recognizer (Phase 7). `None` for
     /// callers that don't supply it (codec/tests) — recognition then declines.
     store_meta: Option<ZarrStoreMeta>,
+    store_kind: StoreKind,
+    /// Shared by this scan's partitions; a new scan starts with an empty one.
+    scan_cache: Arc<ScanCache>,
 }
 
 impl std::fmt::Debug for ZarrExec {
@@ -130,6 +149,8 @@ impl ZarrExec {
             partitions: Vec::new(),
             stream_budget_bytes: None,
             store_meta: None,
+            store_kind: StoreKind::Zarr,
+            scan_cache: Arc::default(),
         }
     }
 
@@ -228,6 +249,15 @@ impl ZarrExec {
     }
 
     /// Store metadata, if attached — coordinates (cube-axis order) and data variables.
+    pub fn with_store_kind(mut self, kind: StoreKind) -> Self {
+        self.store_kind = kind;
+        self
+    }
+
+    pub fn store_kind(&self) -> &StoreKind {
+        &self.store_kind
+    }
+
     pub fn store_meta(&self) -> Option<&ZarrStoreMeta> {
         self.store_meta.as_ref()
     }
@@ -256,6 +286,7 @@ impl ZarrExec {
         .with_partitions(self.partitions.clone())
         .with_stream_budget_bytes(self.stream_budget_bytes)
         .with_store_meta(self.store_meta.clone())
+        .with_store_kind(self.store_kind.clone())
     }
 }
 impl ExecutionPlan for ZarrExec {
@@ -340,6 +371,7 @@ impl ExecutionPlan for ZarrExec {
                 self.coord_filters.clone(),
                 batch_size,
                 stream_budget_bytes,
+                self.scan_cache.clone(),
             );
         }
 
@@ -354,13 +386,17 @@ impl ExecutionPlan for ZarrExec {
                 self.coord_filters.clone(),
                 batch_size,
                 stream_budget_bytes,
+                self.scan_cache.clone(),
             )
-        } else if is_remote_url(&self.path) || self.cached_remote.is_some() {
-            // A cached async store on a non-remote path is an icechunk store
-            // (opened by the factory): read it through the same async path.
+        } else if is_remote_url(&self.path)
+            || self.cached_remote.is_some()
+            || self.store_kind != StoreKind::Zarr
+        {
+            // A local icechunk store is read through the same async path.
             info!("Using remote (async) execution path");
             execute_remote(
                 self.path.clone(),
+                self.store_kind.clone(),
                 self.schema.clone(),
                 self.projection.clone(),
                 self.limit,
@@ -371,6 +407,7 @@ impl ExecutionPlan for ZarrExec {
                 partition_extra,
                 batch_size,
                 stream_budget_bytes,
+                self.scan_cache.clone(),
             )
         } else {
             info!("Using local (sync) execution path");
@@ -428,6 +465,7 @@ struct AsyncReadParams {
     batch_size: usize,
     /// Rule-set streaming row target (Phase 5); `None` => env/batch_size fallback.
     stream_budget_bytes: Option<u64>,
+    cache: Arc<ScanCache>,
 }
 
 /// Execute an async read with the given store setup function.
@@ -477,6 +515,7 @@ where
             params.partition_extra,
             params.batch_size,
             params.stream_budget_bytes,
+            params.cache,
         )
         .await?;
 
@@ -497,6 +536,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn execute_remote(
     path: String,
+    store_kind: StoreKind,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
@@ -507,6 +547,7 @@ fn execute_remote(
     partition_extra: Vec<(usize, CoordSelection)>,
     batch_size: usize,
     stream_budget_bytes: Option<u64>,
+    cache: Arc<ScanCache>,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     use crate::reader::async_tracked_store::AsyncTrackedStore;
     use crate::reader::storage::create_async_store;
@@ -529,6 +570,7 @@ fn execute_remote(
         partition_extra,
         batch_size,
         stream_budget_bytes,
+        cache,
     };
 
     execute_async_read(
@@ -539,9 +581,15 @@ fn execute_remote(
                 (store, prefix, Some(meta))
             } else {
                 debug!("Creating async store (no cache)");
-                let (store, prefix) = create_async_store(&path)
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let (store, prefix) = match store_kind {
+                    StoreKind::Zarr => create_async_store(&path)
+                        .await
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                    StoreKind::Icechunk { group, anonymous } => (
+                        open_icechunk(&path, anonymous).await?,
+                        ObjectPath::from(group.unwrap_or_default().trim_matches('/')),
+                    ),
+                };
                 debug!(prefix = %prefix, "Async store created");
                 (store, prefix, None)
             };
@@ -557,6 +605,30 @@ fn execute_remote(
     )
 }
 
+#[cfg(feature = "icechunk")]
+async fn open_icechunk(
+    path: &str,
+    anonymous: bool,
+) -> datafusion::error::Result<AsyncReadableListableStorage> {
+    use crate::reader::icechunk_store::{open_icechunk_async, open_icechunk_remote};
+    if is_remote_url(path) {
+        open_icechunk_remote(path, anonymous).await
+    } else {
+        open_icechunk_async(path).await
+    }
+    .map_err(DataFusionError::External)
+}
+
+#[cfg(not(feature = "icechunk"))]
+async fn open_icechunk(
+    path: &str,
+    _anonymous: bool,
+) -> datafusion::error::Result<AsyncReadableListableStorage> {
+    Err(DataFusionError::Plan(format!(
+        "{path} is an icechunk store, which needs the `icechunk` feature"
+    )))
+}
+
 /// Execute read from VirtualiZarr Parquet reference store
 #[allow(clippy::too_many_arguments)]
 fn execute_virtualizarr(
@@ -568,6 +640,7 @@ fn execute_virtualizarr(
     coord_filters: Option<CoordFilters>,
     batch_size: usize,
     stream_budget_bytes: Option<u64>,
+    cache: Arc<ScanCache>,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     use crate::reader::schema_inference::discover_arrays;
 
@@ -587,6 +660,7 @@ fn execute_virtualizarr(
         partition_extra: Vec::new(),
         batch_size,
         stream_budget_bytes,
+        cache,
     };
 
     execute_async_read(
@@ -613,6 +687,7 @@ fn execute_virtualizarr_with_adapter(
     coord_filters: Option<CoordFilters>,
     batch_size: usize,
     stream_budget_bytes: Option<u64>,
+    cache: Arc<ScanCache>,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     debug!("Setting up remote VirtualiZarr execution with cached adapter");
 
@@ -626,6 +701,7 @@ fn execute_virtualizarr_with_adapter(
         partition_extra: Vec::new(),
         batch_size,
         stream_budget_bytes,
+        cache,
     };
 
     execute_async_read(
