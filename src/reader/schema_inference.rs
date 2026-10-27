@@ -527,7 +527,7 @@ fn compute_coord_min_max(
     data_type: &str,
 ) -> Option<(f64, f64)> {
     use zarrs::array::Array;
-    use zarrs::array_subset::ArraySubset;
+    use zarrs::array::ArraySubset;
     use zarrs::filesystem::FilesystemStore;
 
     // Open store and array
@@ -542,7 +542,7 @@ fn compute_coord_min_max(
     // Read based on data type and compute min/max
     match data_type {
         "float64" => {
-            let data: Vec<f64> = array.retrieve_array_subset_elements(&subset).ok()?;
+            let data: Vec<f64> = array.retrieve_array_subset(&subset).ok()?;
             if data.is_empty() {
                 return None;
             }
@@ -551,7 +551,7 @@ fn compute_coord_min_max(
             Some((min, max))
         }
         "float32" => {
-            let data: Vec<f32> = array.retrieve_array_subset_elements(&subset).ok()?;
+            let data: Vec<f32> = array.retrieve_array_subset(&subset).ok()?;
             if data.is_empty() {
                 return None;
             }
@@ -560,7 +560,7 @@ fn compute_coord_min_max(
             Some((min, max))
         }
         "int64" => {
-            let data: Vec<i64> = array.retrieve_array_subset_elements(&subset).ok()?;
+            let data: Vec<i64> = array.retrieve_array_subset(&subset).ok()?;
             if data.is_empty() {
                 return None;
             }
@@ -569,7 +569,7 @@ fn compute_coord_min_max(
             Some((min, max))
         }
         "int32" => {
-            let data: Vec<i32> = array.retrieve_array_subset_elements(&subset).ok()?;
+            let data: Vec<i32> = array.retrieve_array_subset(&subset).ok()?;
             if data.is_empty() {
                 return None;
             }
@@ -578,7 +578,7 @@ fn compute_coord_min_max(
             Some((min, max))
         }
         "int16" => {
-            let data: Vec<i16> = array.retrieve_array_subset_elements(&subset).ok()?;
+            let data: Vec<i16> = array.retrieve_array_subset(&subset).ok()?;
             if data.is_empty() {
                 return None;
             }
@@ -587,7 +587,7 @@ fn compute_coord_min_max(
             Some((min, max))
         }
         "uint64" => {
-            let data: Vec<u64> = array.retrieve_array_subset_elements(&subset).ok()?;
+            let data: Vec<u64> = array.retrieve_array_subset(&subset).ok()?;
             if data.is_empty() {
                 return None;
             }
@@ -596,7 +596,7 @@ fn compute_coord_min_max(
             Some((min, max))
         }
         "uint32" => {
-            let data: Vec<u32> = array.retrieve_array_subset_elements(&subset).ok()?;
+            let data: Vec<u32> = array.retrieve_array_subset(&subset).ok()?;
             if data.is_empty() {
                 return None;
             }

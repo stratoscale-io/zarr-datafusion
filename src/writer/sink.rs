@@ -42,7 +42,7 @@ use arrow::datatypes::DataType as ArrowType;
 use arrow::record_batch::RecordBatch;
 use tracing::{debug, info};
 use zarrs::array::Array;
-use zarrs::array_subset::ArraySubset;
+use zarrs::array::ArraySubset;
 use zarrs::filesystem::FilesystemStore;
 
 use crate::physical_plan::partition::plan_partitions;
@@ -298,9 +298,9 @@ fn write_range(
     let subset = ArraySubset::new_with_ranges(&ranges);
     for (v, (array, buf)) in arrays.iter().zip(buffers).enumerate() {
         match buf {
-            Buffer::I64(b) => array.store_array_subset_elements(&subset, &b),
-            Buffer::F32(b) => array.store_array_subset_elements(&subset, &b),
-            Buffer::F64(b) => array.store_array_subset_elements(&subset, &b),
+            Buffer::I64(b) => array.store_array_subset(&subset, b.as_slice()),
+            Buffer::F32(b) => array.store_array_subset(&subset, b.as_slice()),
+            Buffer::F64(b) => array.store_array_subset(&subset, b.as_slice()),
         }
         .map_err(|e| format!("store '{}': {e}", spec.data_vars[v].name))?;
     }

@@ -16,7 +16,7 @@ use datafusion::{
 use futures::stream;
 use std::sync::Arc;
 use std::time::Instant;
-use zarrs::{array::Array, array_subset::ArraySubset, filesystem::FilesystemStore};
+use zarrs::{array::Array, array::ArraySubset, filesystem::FilesystemStore};
 
 use super::cf_time::apply_cf_time_conversion;
 use super::coord::{
@@ -79,104 +79,92 @@ fn arrow_dtype_to_bytes(dtype: &DataType) -> u64 {
 /// Macro to read coordinate array values with type dispatch.
 /// Handles both sync and async variants of zarrs array retrieval.
 macro_rules! read_coord_values {
-    // Sync version - uses retrieve_array_subset_ndarray
+    // Sync version
     (sync, $arr:expr, $subset:expr, $dtype:expr) => {
         match $dtype {
             "float32" => {
-                let (vals, _) = $arr
-                    .retrieve_array_subset_ndarray::<f32>($subset)
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                let vals = $arr
+                    .retrieve_array_subset::<Vec<f32>>($subset)
+                    .map_err(zarr_err)?;
                 CoordValues::Float32(vals)
             }
             "float64" => {
-                let (vals, _) = $arr
-                    .retrieve_array_subset_ndarray::<f64>($subset)
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                let vals = $arr
+                    .retrieve_array_subset::<Vec<f64>>($subset)
+                    .map_err(zarr_err)?;
                 CoordValues::Float64(vals)
             }
             "int32" => {
-                let (vals, _) = $arr
-                    .retrieve_array_subset_ndarray::<i32>($subset)
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                let vals = $arr
+                    .retrieve_array_subset::<Vec<i32>>($subset)
+                    .map_err(zarr_err)?;
                 // Convert to i64 for uniform handling
                 CoordValues::Int64(vals.into_iter().map(|v| v as i64).collect())
             }
             "uint32" => {
-                let (vals, _) = $arr
-                    .retrieve_array_subset_ndarray::<u32>($subset)
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                let vals = $arr
+                    .retrieve_array_subset::<Vec<u32>>($subset)
+                    .map_err(zarr_err)?;
                 CoordValues::Int64(vals.into_iter().map(|v| v as i64).collect())
             }
             "int16" => {
-                let (vals, _) = $arr
-                    .retrieve_array_subset_ndarray::<i16>($subset)
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                let vals = $arr
+                    .retrieve_array_subset::<Vec<i16>>($subset)
+                    .map_err(zarr_err)?;
                 CoordValues::Int64(vals.into_iter().map(|v| v as i64).collect())
             }
             _ => {
-                let (vals, _) = $arr
-                    .retrieve_array_subset_ndarray::<i64>($subset)
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                let vals = $arr
+                    .retrieve_array_subset::<Vec<i64>>($subset)
+                    .map_err(zarr_err)?;
                 CoordValues::Int64(vals)
             }
         }
     };
-    // Async version - uses async_retrieve_array_subset_ndarray
+    // Async version
     (async, $arr:expr, $subset:expr, $dtype:expr) => {
         match $dtype {
             "float32" => {
-                let (vals, _) = $arr
-                    .async_retrieve_array_subset_ndarray::<f32>($subset)
+                let vals = $arr
+                    .async_retrieve_array_subset::<Vec<f32>>($subset)
                     .await
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                    .map_err(zarr_err)?;
                 CoordValues::Float32(vals)
             }
             "float64" => {
-                let (vals, _) = $arr
-                    .async_retrieve_array_subset_ndarray::<f64>($subset)
+                let vals = $arr
+                    .async_retrieve_array_subset::<Vec<f64>>($subset)
                     .await
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                    .map_err(zarr_err)?;
                 CoordValues::Float64(vals)
             }
             "int32" => {
-                let (vals, _) = $arr
-                    .async_retrieve_array_subset_ndarray::<i32>($subset)
+                let vals = $arr
+                    .async_retrieve_array_subset::<Vec<i32>>($subset)
                     .await
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                    .map_err(zarr_err)?;
                 // Convert to i64 for uniform handling
                 CoordValues::Int64(vals.into_iter().map(|v| v as i64).collect())
             }
             "uint32" => {
-                let (vals, _) = $arr
-                    .async_retrieve_array_subset_ndarray::<u32>($subset)
+                let vals = $arr
+                    .async_retrieve_array_subset::<Vec<u32>>($subset)
                     .await
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                    .map_err(zarr_err)?;
                 CoordValues::Int64(vals.into_iter().map(|v| v as i64).collect())
             }
             "int16" => {
-                let (vals, _) = $arr
-                    .async_retrieve_array_subset_ndarray::<i16>($subset)
+                let vals = $arr
+                    .async_retrieve_array_subset::<Vec<i16>>($subset)
                     .await
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                    .map_err(zarr_err)?;
                 CoordValues::Int64(vals.into_iter().map(|v| v as i64).collect())
             }
             _ => {
-                let (vals, _) = $arr
-                    .async_retrieve_array_subset_ndarray::<i64>($subset)
+                let vals = $arr
+                    .async_retrieve_array_subset::<Vec<i64>>($subset)
                     .await
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                    .map_err(zarr_err)?;
                 CoordValues::Int64(vals)
             }
         }
@@ -190,24 +178,21 @@ macro_rules! read_data_array {
     (sync, $arr:expr, $subset:expr, $data_type:expr) => {
         match $data_type {
             DataType::Float32 => {
-                let (vals, _) = $arr
-                    .retrieve_array_subset_ndarray::<f32>($subset)
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                let vals = $arr
+                    .retrieve_array_subset::<Vec<f32>>($subset)
+                    .map_err(zarr_err)?;
                 Arc::new(Float32Array::from(vals)) as ArrayRef
             }
             DataType::Float64 => {
-                let (vals, _) = $arr
-                    .retrieve_array_subset_ndarray::<f64>($subset)
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                let vals = $arr
+                    .retrieve_array_subset::<Vec<f64>>($subset)
+                    .map_err(zarr_err)?;
                 Arc::new(Float64Array::from(vals)) as ArrayRef
             }
             _ => {
-                let (vals, _) = $arr
-                    .retrieve_array_subset_ndarray::<i64>($subset)
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                let vals = $arr
+                    .retrieve_array_subset::<Vec<i64>>($subset)
+                    .map_err(zarr_err)?;
                 Arc::new(Int64Array::from(vals)) as ArrayRef
             }
         }
@@ -216,27 +201,24 @@ macro_rules! read_data_array {
     (async, $arr:expr, $subset:expr, $data_type:expr) => {
         match $data_type {
             DataType::Float32 => {
-                let (vals, _) = $arr
-                    .async_retrieve_array_subset_ndarray::<f32>($subset)
+                let vals = $arr
+                    .async_retrieve_array_subset::<Vec<f32>>($subset)
                     .await
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                    .map_err(zarr_err)?;
                 Arc::new(Float32Array::from(vals)) as ArrayRef
             }
             DataType::Float64 => {
-                let (vals, _) = $arr
-                    .async_retrieve_array_subset_ndarray::<f64>($subset)
+                let vals = $arr
+                    .async_retrieve_array_subset::<Vec<f64>>($subset)
                     .await
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                    .map_err(zarr_err)?;
                 Arc::new(Float64Array::from(vals)) as ArrayRef
             }
             _ => {
-                let (vals, _) = $arr
-                    .async_retrieve_array_subset_ndarray::<i64>($subset)
+                let vals = $arr
+                    .async_retrieve_array_subset::<Vec<i64>>($subset)
                     .await
-                    .map_err(zarr_err)?
-                    .into_raw_vec_and_offset();
+                    .map_err(zarr_err)?;
                 Arc::new(Int64Array::from(vals)) as ArrayRef
             }
         }

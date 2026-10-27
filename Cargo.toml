@@ -20,7 +20,7 @@ chrono = "0.4"
 datafusion = "54.0.0"
 futures = "0.3.31"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-zarrs = { version = "0.22.10", features = ["ndarray", "async", "zlib"] }
+zarrs = { version = "0.23", features = ["ndarray", "async", "zlib", "pcodec"] }
 zarrs_object_store = { version = "0.6", features = ["gcp", "aws", "http"] }
 # Icechunk store support. Optional: only pulled in by the `icechunk` feature
 # (~56 transitive crates), so the default build stays lean. zarrs_icechunk
@@ -109,4 +109,6 @@ version = "0.53"
 version = "0.50"
 
 [dev-dependencies]
+# the icechunk examples index into what zarrs reads; zarrs's own version
+ndarray = "0.17"
 proptest = "1.0"
