@@ -7,23 +7,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::util::pretty::print_batches;
-use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::{collect, ExecutionPlan};
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::SessionContext;
 use highlight::SqlHelper;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 use tracing_subscriber::EnvFilter;
-use zarr_datafusion::datasource::factory::ZarrTableFactory;
-use zarr_datafusion::datasource::object_store_registry::RemoteObjectStoreRegistry;
-use zarr_datafusion::optimizer::{
-    CardinalityRule, CountStatisticsRule, MinMaxStatisticsRule, ZarrLimitPushdownRule,
-};
 use zarr_datafusion::physical_plan::zarr_exec::ZarrExec;
 use zarr_datafusion::reader::stats::{format_bytes, SharedIoStats};
-use zarr_datafusion::udfs::register_metric_udfs;
-use zarr_datafusion::udtf::register_zarr_functions;
+use zarr_datafusion::session::{build_session_context, zarr_session_config};
 
 const HISTORY_FILE: &str = ".zarr_cli_history";
 
@@ -218,34 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
-    let config = SessionConfig::new().with_information_schema(true);
-    // Lets Parquet/CSV/JSON tables use http(s)://, gs:// and s3:// locations
-    // (Zarr tables open their own stores).
-    let runtime = RuntimeEnvBuilder::new()
-        .with_object_store_registry(Arc::new(RemoteObjectStoreRegistry::new()))
-        .build_arc()?;
-    let state = SessionStateBuilder::new()
-        .with_default_features()
-        .with_config(config)
-        .with_runtime_env(runtime)
-        .with_table_factory("ZARR".to_string(), Arc::new(ZarrTableFactory) as _)
-        .with_optimizer_rule(Arc::new(CountStatisticsRule::new()))
-        .with_optimizer_rule(Arc::new(MinMaxStatisticsRule::new()))
-        .with_physical_optimizer_rule(Arc::new(ZarrLimitPushdownRule::new()))
-        .with_physical_optimizer_rule(Arc::new(CardinalityRule::new()))
-        .build();
-    let ctx = SessionContext::new_with_state(state);
-
-    // Register `COPY TO ... STORED AS ZARR` (the write verb).
-    if let Err(e) = zarr_datafusion::writer::register_zarr_write_format(&ctx) {
-        eprintln!("warning: could not register Zarr write format: {e}");
-    }
-
-    // Register Zarr-specific table functions
-    register_zarr_functions(&ctx);
-
-    // Register metric UDFs for weather evaluation
-    register_metric_udfs(&ctx);
+    let ctx = build_session_context(zarr_session_config())?;
 
     // Batch mode: run when files/commands are given, or when stdin is piped.
     // Otherwise fall through to the interactive REPL.
