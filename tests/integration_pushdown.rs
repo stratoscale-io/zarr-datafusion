@@ -987,3 +987,104 @@ async fn test_limit_pushdown_preserves_smaller_existing_limit() {
     let batch = execute_query_single(&ctx, sql).await;
     assert_eq!(batch.num_rows(), 3, "Should return exactly 3 rows");
 }
+
+// ============================================================================
+// Limit pushdown must not change results
+// ============================================================================
+//
+// A LIMIT may only reach ZarrExec through operators that pass rows through
+// one-for-one. Below an aggregate, join or sort, reading fewer input rows
+// changes the answer, not just its size. These compare against the same query
+// without pushdown (the full result, limited afterwards).
+
+/// Pretty-printed rows of `sql`, sorted, for order-insensitive comparison.
+async fn sorted_rows(ctx: &datafusion::prelude::SessionContext, sql: &str) -> Vec<String> {
+    let batches = execute_query(ctx, sql).await;
+    let text = arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    let mut rows: Vec<String> = text
+        .lines()
+        .filter(|l| l.starts_with('|'))
+        .skip(1)
+        // Pretty-printing pads cells to each result's widest value.
+        .map(|l| l.split('|').map(str::trim).collect::<Vec<_>>().join("|"))
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[tokio::test]
+async fn test_limit_above_group_by_keeps_aggregates_correct() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+    let grouped = "SELECT time, AVG(temperature) AS a, COUNT(*) AS n FROM data GROUP BY time";
+
+    let plan = get_physical_plan(&ctx, &format!("SELECT * FROM ({grouped}) q LIMIT 7")).await;
+    let zarr_exec = find_zarr_exec(&plan).expect("Should have ZarrExec");
+    assert_eq!(
+        zarr_exec.limit(),
+        None,
+        "LIMIT must not pass below GROUP BY"
+    );
+
+    // All 7 groups, each over its full 100 cells.
+    let limited = sorted_rows(&ctx, &format!("SELECT * FROM ({grouped}) q LIMIT 7")).await;
+    assert_eq!(limited, sorted_rows(&ctx, grouped).await);
+}
+
+#[tokio::test]
+async fn test_limit_above_order_by_returns_smallest_rows() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    let limited = sorted_rows(
+        &ctx,
+        "SELECT temperature FROM data ORDER BY temperature LIMIT 5",
+    )
+    .await;
+    let mut all = sorted_rows(&ctx, "SELECT temperature FROM data").await;
+    // Compare numerically: the 5 smallest of all 700 temperatures.
+    let parse = |r: &String| r.trim_matches('|').parse::<i64>().unwrap();
+    all.sort_by_key(parse);
+    let mut expected: Vec<String> = all.into_iter().take(5).collect();
+    expected.sort();
+    assert_eq!(limited, expected);
+}
+
+#[tokio::test]
+async fn test_limit_above_join_keeps_join_correct() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+    let joined = "SELECT d.time, d.lat, d.temperature - c.clim AS anomaly \
+                  FROM data d JOIN (SELECT lat, AVG(temperature) AS clim FROM data GROUP BY lat) c \
+                  ON d.lat = c.lat";
+
+    let limited = execute_query(&ctx, &format!("SELECT * FROM ({joined}) q LIMIT 50")).await;
+    assert_eq!(limited.iter().map(|b| b.num_rows()).sum::<usize>(), 50);
+    // Every returned row is a row of the full join.
+    let all = sorted_rows(&ctx, joined).await;
+    for row in sorted_rows(&ctx, &format!("SELECT * FROM ({joined}) q LIMIT 50")).await {
+        assert!(
+            all.binary_search(&row).is_ok(),
+            "row not in full join: {row}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_limit_with_offset_pushes_skip_plus_fetch() {
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "data", SYNTHETIC_V3);
+
+    let plan = get_physical_plan(&ctx, "SELECT * FROM data LIMIT 5 OFFSET 10").await;
+    let zarr_exec = find_zarr_exec(&plan).expect("Should have ZarrExec");
+    assert_eq!(
+        zarr_exec.limit(),
+        Some(15),
+        "scan must read offset + limit rows"
+    );
+
+    let batch = execute_query_single(&ctx, "SELECT * FROM data LIMIT 5 OFFSET 10").await;
+    assert_eq!(batch.num_rows(), 5);
+}

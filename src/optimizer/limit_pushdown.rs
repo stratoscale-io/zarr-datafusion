@@ -25,8 +25,9 @@
 //!
 //! ## Solution
 //!
-//! This rule finds limits anywhere in the plan tree (from CoalescePartitionsExec,
-//! GlobalLimitExec, or LocalLimitExec) and pushes them into ZarrExec:
+//! This rule picks up limits as it walks down the plan (from CoalescePartitionsExec,
+//! GlobalLimitExec, or LocalLimitExec) and pushes them into ZarrExec, through
+//! operators that pass rows through one-for-one:
 //! ```text
 //! CoalescePartitionsExec: fetch=5
 //!   FilterExec: latitude >= 24 AND ...
@@ -38,8 +39,11 @@
 //! This rule is sound (produces equivalent results) when:
 //!
 //! 1. **Plan Structure**: LIMIT is represented as `CoalescePartitionsExec(fetch=N)`,
-//!    `GlobalLimitExec`, or `LocalLimitExec` somewhere in the plan tree. The rule
-//!    searches recursively to handle platform/version differences.
+//!    `GlobalLimitExec`, or `LocalLimitExec` somewhere in the plan tree. A limit
+//!    only moves down through projections, filters, repartitioning, coalescing
+//!    and other limits ([`passes_limit_through`]). Below an aggregate, join,
+//!    sort, window or union, reading fewer input rows changes the result, so the
+//!    limit stops there.
 //!
 //! 2. **Filter Internalization**: All coordinate filters between the LIMIT and
 //!    ZarrExec are already captured in `ZarrExec.coord_filters`. This is true
@@ -55,8 +59,8 @@
 //!   but may return fewer rows than expected (correct but potentially confusing).
 //!
 //! - The exact plan structure varies across DataFusion versions, platforms
-//!   (macOS vs Linux), and Rust toolchains (stable vs nightly). The recursive
-//!   search handles this variability.
+//!   (macOS vs Linux), and Rust toolchains (stable vs nightly). The limit is
+//!   picked up wherever the limit node sits on the path down to ZarrExec.
 //!
 //! See `docs/OPTIMIZER_SOUNDNESS.md` for detailed soundness documentation.
 
@@ -65,7 +69,10 @@ use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -117,21 +124,9 @@ impl PhysicalOptimizerRule for ZarrLimitPushdownRule {
             "ZarrLimitPushdownRule::optimize called"
         );
 
-        // Search for limit anywhere in the plan tree (not just at root)
-        // This handles platform/version differences in DataFusion's plan structure
-        let limit = find_limit_anywhere(&plan);
-
-        if let Some(limit_value) = limit {
-            debug!(
-                limit = limit_value,
-                "Found limit in plan tree, attempting pushdown"
-            );
-            push_limit_to_zarr(plan, Some(limit_value))
-        } else {
-            debug!("No limit found in plan tree, recursing to optimize children");
-            // No limit found, just recurse to optimize children
-            push_limit_to_zarr(plan, None)
-        }
+        // Limits are picked up on the way down, so a limit only reaches the
+        // ZarrExecs below it (not scans in other branches of the plan).
+        push_limit_to_zarr(plan, None)
     }
 
     fn schema_check(&self) -> bool {
@@ -175,31 +170,7 @@ fn format_plan_structure(plan: &Arc<dyn ExecutionPlan>, depth: usize) -> String 
     result
 }
 
-/// Find limit value from CoalescePartitionsExec, GlobalLimitExec, or LocalLimitExec
-/// anywhere in the plan tree (not just at root).
-///
-/// This handles platform/version differences where the limit node may appear at
-/// different positions in the plan tree.
-///
-/// If multiple limits exist in the tree, returns the minimum to ensure correctness.
-fn find_limit_anywhere(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
-    // Check current node for limit
-    let current_limit = extract_limit_from_node(plan);
-
-    // Recurse into children and find minimum limit
-    let child_limits: Vec<usize> = plan
-        .children()
-        .iter()
-        .filter_map(|child| find_limit_anywhere(child))
-        .collect();
-
-    // Return minimum of current and all child limits
-    let all_limits: Vec<usize> = current_limit.into_iter().chain(child_limits).collect();
-
-    all_limits.into_iter().min()
-}
-
-/// Extract limit value from a single plan node (not recursive)
+/// Extract the number of input rows a single plan node needs (not recursive)
 fn extract_limit_from_node(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
     // Check for CoalescePartitionsExec with fetch
     if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>() {
@@ -208,10 +179,10 @@ fn extract_limit_from_node(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
         }
     }
 
-    // Check for GlobalLimitExec
+    // Check for GlobalLimitExec; with OFFSET it needs skip + fetch rows
     if let Some(global_limit) = plan.downcast_ref::<GlobalLimitExec>() {
         if let Some(fetch) = global_limit.fetch() {
-            return Some(fetch);
+            return Some(global_limit.skip() + fetch);
         }
     }
 
@@ -278,6 +249,15 @@ fn push_limit_to_zarr(
         );
     }
 
+    // Below an operator that combines, reorders or multiplies rows, fewer
+    // input rows change the result: stop carrying the limit (limits found
+    // further down are still pushed).
+    let child_limit = if passes_limit_through(&plan) {
+        effective_limit
+    } else {
+        None
+    };
+
     // Recursively process children
     let children = plan.children();
     debug!(num_children = children.len(), "Processing children");
@@ -287,10 +267,23 @@ fn push_limit_to_zarr(
 
     let new_children: Result<Vec<Arc<dyn ExecutionPlan>>> = children
         .into_iter()
-        .map(|child| push_limit_to_zarr(child.clone(), effective_limit))
+        .map(|child| push_limit_to_zarr(child.clone(), child_limit))
         .collect();
 
     plan.with_new_children(new_children?)
+}
+
+/// Whether a LIMIT above `plan` may move below it: true for operators whose
+/// first N output rows come from their first N input rows. Filters count
+/// because ZarrExec internalizes coordinate filters (see the module docs for
+/// data-variable filters).
+fn passes_limit_through(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.downcast_ref::<ProjectionExec>().is_some()
+        || plan.downcast_ref::<FilterExec>().is_some()
+        || plan.downcast_ref::<RepartitionExec>().is_some()
+        || plan.downcast_ref::<CoalescePartitionsExec>().is_some()
+        || plan.downcast_ref::<GlobalLimitExec>().is_some()
+        || plan.downcast_ref::<LocalLimitExec>().is_some()
 }
 
 #[cfg(test)]
