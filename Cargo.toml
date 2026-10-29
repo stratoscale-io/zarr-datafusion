@@ -112,6 +112,11 @@ name = "integration_flightsql"
 path = "tests/integration_flightsql.rs"
 required-features = ["flightsql"]
 
+[[test]]
+name = "integration_catalog"
+path = "tests/integration_catalog.rs"
+required-features = ["flightsql"]
+
 [dependencies.rustyline]
 version = "15"
 features = ["derive"]

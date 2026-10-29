@@ -248,7 +248,7 @@ async fn test_view_window_blocks_filter() {
 /// V5: replacing an upstream view. DataFusion's ViewTable keeps the plan
 /// resolved at creation, so a downstream view keeps the old definition.
 #[tokio::test]
-#[ignore = "known gap: stale downstream views, fixed by LateBindingView (plan Phase 3)"]
+#[ignore = "documents DataFusion: stale downstream views; zarr-flightsql fixes it in CatalogManager (tests/integration_catalog.rs)"]
 async fn test_view_replace_upstream_is_seen_downstream() {
     let ctx = create_test_context();
     register_zarr_table(&ctx, "data", SYNTHETIC_V3);

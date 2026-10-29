@@ -6,30 +6,37 @@
 //!
 //! Usage:
 //!   zarr-flightsql [--addr 127.0.0.1:50051] [--token SECRET] [--init-sql FILE]...
+//!                  [--journal catalog.jsonl]
+//!
+//! With `--journal`, tables, views and schemas created by clients survive
+//! restarts: the journal is replayed after the `--init-sql` files.
 //!
 //! The token can also come from `ZARR_FLIGHTSQL_TOKEN`. Clients then send
 //! `authorization: Bearer SECRET`.
 
 use std::error::Error;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::DFParser;
 use tonic::transport::Server;
 
-use zarr_datafusion::flightsql::flight_sql_service;
+use zarr_datafusion::flightsql::{flight_sql_service, CatalogManager};
 use zarr_datafusion::session::{build_session_context, zarr_session_config};
 
 struct Args {
     addr: SocketAddr,
     token: Option<String>,
     init_sql: Vec<String>,
+    journal: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut addr = "127.0.0.1:50051".to_string();
     let mut token = std::env::var("ZARR_FLIGHTSQL_TOKEN").ok();
     let mut init_sql = Vec::new();
+    let mut journal = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -37,8 +44,9 @@ fn parse_args() -> Result<Args, String> {
             "--addr" => addr = it.next().ok_or("--addr needs a value")?,
             "--token" => token = Some(it.next().ok_or("--token needs a value")?),
             "--init-sql" => init_sql.push(it.next().ok_or("--init-sql needs a value")?),
+            "--journal" => journal = Some(it.next().ok_or("--journal needs a value")?),
             "-h" | "--help" => return Err(
-                "usage: zarr-flightsql [--addr HOST:PORT] [--token SECRET] [--init-sql FILE]..."
+                "usage: zarr-flightsql [--addr HOST:PORT] [--token SECRET] [--init-sql FILE]... [--journal FILE]"
                     .into(),
             ),
             other => return Err(format!("unexpected argument: {other}")),
@@ -51,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
             .map_err(|e| format!("invalid --addr {addr}: {e}"))?,
         token,
         init_sql,
+        journal,
     })
 }
 
@@ -83,6 +92,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for path in &args.init_sql {
         run_init_sql(&ctx, path).await?;
     }
+    let catalog = match &args.journal {
+        Some(path) => CatalogManager::open(ctx, path).await?,
+        None => CatalogManager::new(ctx),
+    };
 
     println!(
         "zarr-flightsql listening on grpc://{}{}",
@@ -94,7 +107,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     );
     Server::builder()
-        .add_service(flight_sql_service(ctx, args.token))
+        .add_service(flight_sql_service(Arc::new(catalog), args.token))
         .serve(args.addr)
         .await?;
     Ok(())

@@ -4,6 +4,8 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
@@ -18,12 +20,20 @@ use futures::TryStreamExt;
 use prost::Message;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Channel, Endpoint, Server};
-use zarr_datafusion::flightsql::flight_sql_service;
+use zarr_datafusion::flightsql::{flight_sql_service, CatalogManager};
 use zarr_datafusion::session::{build_session_context, zarr_session_config};
 
 /// Start a server with `weather` (synthetic v3) registered. Returns its
 /// address and the session it serves, for comparing against local results.
 async fn start_server(token: Option<&str>) -> (SocketAddr, SessionContext) {
+    start_server_with(token, None).await
+}
+
+/// Like [`start_server`], optionally with a catalog journal at `journal`.
+async fn start_server_with(
+    token: Option<&str>,
+    journal: Option<&Path>,
+) -> (SocketAddr, SessionContext) {
     let ctx = build_session_context(zarr_session_config()).unwrap();
     ctx.sql(&format!(
         "CREATE EXTERNAL TABLE weather STORED AS ZARR LOCATION '{SYNTHETIC_V3}'"
@@ -33,7 +43,11 @@ async fn start_server(token: Option<&str>) -> (SocketAddr, SessionContext) {
 
     let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = incoming.local_addr().unwrap();
-    let service = flight_sql_service(ctx.clone(), token.map(String::from));
+    let catalog = match journal {
+        Some(path) => CatalogManager::open(ctx.clone(), path).await.unwrap(),
+        None => CatalogManager::new(ctx.clone()),
+    };
+    let service = flight_sql_service(Arc::new(catalog), token.map(String::from));
     tokio::spawn(
         Server::builder()
             .add_service(service)
@@ -223,4 +237,32 @@ async fn test_flightsql_sql_info() {
     let (_, batches) = fetch(&mut client, info).await.unwrap();
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     assert!(pretty(&batches).contains("zarr-datafusion"));
+}
+
+/// With a journal, views created by clients are back after a restart.
+#[tokio::test]
+async fn test_flightsql_journal_survives_restart() {
+    let dir = std::env::temp_dir().join(format!("zarr-flightsql-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let journal = dir.join("catalog.jsonl");
+    let _ = std::fs::remove_file(&journal);
+
+    let (addr, _ctx) = start_server_with(None, Some(&journal)).await;
+    let mut client = connect(addr).await;
+    run_sql(
+        &mut client,
+        "CREATE VIEW t3 AS SELECT * FROM weather WHERE time = 3",
+    )
+    .await
+    .unwrap();
+
+    // A second server on the same journal, as after a restart.
+    let (addr, _ctx) = start_server_with(None, Some(&journal)).await;
+    let mut client = connect(addr).await;
+    let (_, batches) = run_sql(&mut client, "SELECT COUNT(*) AS n FROM t3")
+        .await
+        .unwrap();
+    assert_eq!(get_scalar_i64(&batches[0]), 100);
+
+    std::fs::remove_dir_all(&dir).unwrap();
 }

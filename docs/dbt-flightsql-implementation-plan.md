@@ -353,6 +353,65 @@ rebuild downstream models.
 same `information_schema` and the same query results. A single-model rebuild is
 visible downstream without rebuilding the downstream models.
 
+### Status (2026-10-29, on tower): done, with a different design for stale views
+
+**No `LateBindingView`.** Two facts made a view provider that re-plans on
+every scan the wrong tool:
+1. `TableProvider::get_logical_plan()` has no session to plan with.
+2. DataFusion 54 expands a view into the referencing statement's plan while
+   planning it (`LogicalPlanBuilder::scan`). That expansion is what lets
+   filters reach `ZarrExec`.
+
+Instead, `src/flightsql/catalog.rs` adds a `CatalogManager` that every server
+statement goes through:
+- **Recording.** It records each view's SQL and the relations it names. These
+  come from `resolve_table_references` on the parsed SQL; the plan can't be
+  used because referenced views are already expanded in it.
+- **Refresh.** After a DDL statement creates, replaces or drops a relation,
+  it re-creates every dependent view transitively, each once, with
+  `or_replace` set. Views stay ordinary `ViewTable`s, so pushdown is
+  unchanged (tested).
+- **Dropped upstream.** If a view's upstream is dropped, the view is
+  deregistered: queries fail with "not found" instead of reading stale data.
+  It comes back automatically when the upstream is created again.
+- **Locking.** DDL is serialized behind a lock and planned again under it.
+  Queries and DML don't take the lock.
+
+**Journal** (`--journal FILE`, JSON lines `{"sql": ...}` holding the client's
+SQL text exactly as sent, fsynced per statement; JSON instead of `.sql` so
+statements never need splitting):
+- Replayed after `--init-sql`. Statements that fail because something they
+  read is created later are retried until nothing more succeeds; entries
+  that still fail are dropped with a warning.
+- Rewritten atomically (temp file + rename) to just the live objects on
+  every open.
+- `CREATE … IF NOT EXISTS` on an existing object is a no-op and is not
+  recorded, so the original definition wins. `DROP SCHEMA … CASCADE`
+  forgets everything in the schema.
+- **Not kept across restarts:**
+  - rows added with `INSERT` (`CREATE TABLE AS` is recomputed on replay);
+  - `SET` options;
+  - views that are deregistered (upstream missing) at shutdown;
+  - views defined in `--init-sql` files, which aren't tracked for refresh.
+
+Tests:
+- `tests/integration_catalog.rs` (7 tests):
+  - a replaced upstream is seen downstream, transitively;
+  - pushdown still works after a refresh;
+  - drop upstream → "not found", then recreate → back;
+  - replay + compaction (schema, views, `CREATE TABLE AS`, drop);
+  - out-of-order replay;
+  - `IF NOT EXISTS`;
+  - `DROP SCHEMA CASCADE`.
+- `tests/integration_flightsql.rs` gains a restart-with-journal test (9 in
+  total).
+- End to end with the binary over ADBC: replacing `stg` was visible through
+  `fct` immediately. After a restart the chain and `information_schema` came
+  back, and the journal compacted from 4 to 3 entries with `fct` before
+  `stg`, which replay resolved.
+- Phase 0's V5 test stays `#[ignore]`d. It documents DataFusion's own
+  behavior, which the server now works around.
+
 ---
 
 ## Phase 4 — `dbt-zarr` adapter (Python)

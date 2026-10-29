@@ -5,29 +5,35 @@
 //! with no conversion of the store. See docs/dbt-flightsql-implementation-plan.md.
 //!
 //! ```no_run
+//! use std::sync::Arc;
+//!
 //! use tonic::transport::Server;
-//! use zarr_datafusion::flightsql::flight_sql_service;
+//! use zarr_datafusion::flightsql::{flight_sql_service, CatalogManager};
 //! use zarr_datafusion::session::{build_session_context, zarr_session_config};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let ctx = build_session_context(zarr_session_config())?;
+//! let catalog = CatalogManager::open(ctx, "catalog.jsonl").await?;
 //! Server::builder()
-//!     .add_service(flight_sql_service(ctx, None))
+//!     .add_service(flight_sql_service(Arc::new(catalog), None))
 //!     .serve("127.0.0.1:50051".parse()?)
 //!     .await?;
 //! # Ok(())
 //! # }
 //! ```
 
+mod catalog;
 mod service;
 mod statement;
 
+use std::sync::Arc;
+
 use arrow_flight::flight_service_server::FlightServiceServer;
-use datafusion::prelude::SessionContext;
 use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
 
+pub use catalog::CatalogManager;
 pub use service::ZarrFlightSqlService;
 
 /// Rejects calls without `authorization: Bearer <token>` when a token is set.
@@ -56,11 +62,14 @@ impl Interceptor for BearerAuth {
     }
 }
 
-/// The Flight SQL gRPC service for `ctx`, behind optional bearer-token auth.
-/// Add it to a `tonic::transport::Server`.
+/// The Flight SQL gRPC service over `catalog`, behind optional bearer-token
+/// auth. Add it to a `tonic::transport::Server`.
 pub fn flight_sql_service(
-    ctx: SessionContext,
+    catalog: Arc<CatalogManager>,
     token: Option<String>,
 ) -> InterceptedService<FlightServiceServer<ZarrFlightSqlService>, BearerAuth> {
-    FlightServiceServer::with_interceptor(ZarrFlightSqlService::new(ctx), BearerAuth::new(token))
+    FlightServiceServer::with_interceptor(
+        ZarrFlightSqlService::new(catalog),
+        BearerAuth::new(token),
+    )
 }

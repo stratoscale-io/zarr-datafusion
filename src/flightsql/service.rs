@@ -1,7 +1,7 @@
 //! `FlightSqlService` over one shared `SessionContext`.
 
 use std::pin::Pin;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -15,11 +15,11 @@ use arrow_flight::sql::{
 use arrow_flight::{
     FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, Ticket,
 };
-use datafusion::prelude::SessionContext;
 use futures::{stream, Stream, TryStreamExt};
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 
+use super::catalog::CatalogManager;
 use super::statement::{execute_update, plan_statement, to_status, StatementTicket};
 
 static SQL_INFO: LazyLock<SqlInfoData> = LazyLock::new(|| {
@@ -32,16 +32,17 @@ static SQL_INFO: LazyLock<SqlInfoData> = LazyLock::new(|| {
     builder.build().expect("static SqlInfo is valid")
 });
 
-/// Flight SQL service. Every connection shares `ctx`, so all clients (e.g.
-/// the several connections of a multi-threaded dbt run) see one catalog.
+/// Flight SQL service. Every connection shares one catalog manager and its
+/// session, so all clients (e.g. the several connections of a
+/// multi-threaded dbt run) see one catalog.
 #[derive(Clone)]
 pub struct ZarrFlightSqlService {
-    ctx: SessionContext,
+    catalog: Arc<CatalogManager>,
 }
 
 impl ZarrFlightSqlService {
-    pub fn new(ctx: SessionContext) -> Self {
-        Self { ctx }
+    pub fn new(catalog: Arc<CatalogManager>) -> Self {
+        Self { catalog }
     }
 }
 
@@ -72,7 +73,7 @@ impl FlightSqlService for ZarrFlightSqlService {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let planned = plan_statement(&self.ctx, &query.query)
+        let planned = plan_statement(&self.catalog, &query.query)
             .await
             .map_err(to_status)?;
         let handle = planned.ticket.encode().map_err(to_status)?;
@@ -96,7 +97,7 @@ impl FlightSqlService for ZarrFlightSqlService {
     ) -> Result<Response<DoGetStream>, Status> {
         match StatementTicket::decode(&ticket.statement_handle)? {
             StatementTicket::Query(sql) => {
-                let df = self.ctx.sql(&sql).await.map_err(to_status)?;
+                let df = self.catalog.ctx().sql(&sql).await.map_err(to_status)?;
                 let batches = df.execute_stream().await.map_err(to_status)?;
                 let schema = batches.schema();
                 let batches = batches.map_err(|e| FlightError::Tonic(Box::new(to_status(e))));
@@ -121,7 +122,7 @@ impl FlightSqlService for ZarrFlightSqlService {
         query: CommandStatementUpdate,
         _request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        execute_update(&self.ctx, &query.query)
+        execute_update(&self.catalog, &query.query)
             .await
             .map_err(to_status)
     }

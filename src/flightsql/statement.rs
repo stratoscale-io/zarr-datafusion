@@ -17,8 +17,9 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::prelude::SessionContext;
 use tonic::Status;
+
+use super::catalog::CatalogManager;
 
 const QUERY_TAG: u8 = b'q';
 const RESULT_TAG: u8 = b'r';
@@ -79,14 +80,15 @@ pub(crate) struct PlannedStatement {
     pub ticket: StatementTicket,
 }
 
-/// Plan `sql`; run it right away if it changes state (DDL, DML, `COPY`,
-/// `SET`), otherwise defer execution to `DoGet`.
-pub(crate) async fn plan_statement(ctx: &SessionContext, sql: &str) -> Result<PlannedStatement> {
-    let plan = ctx.state().create_logical_plan(sql).await?;
+/// Plan `sql`; run it right away (through the catalog manager) if it changes
+/// state (DDL, DML, `COPY`, `SET`), otherwise defer execution to `DoGet`.
+pub(crate) async fn plan_statement(
+    catalog: &CatalogManager,
+    sql: &str,
+) -> Result<PlannedStatement> {
+    let plan = catalog.ctx().state().create_logical_plan(sql).await?;
     if has_side_effects(&plan) {
-        let df = ctx.execute_logical_plan(plan).await?;
-        let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
-        let batches = df.collect().await?;
+        let (schema, batches) = catalog.execute(sql).await?;
         return Ok(PlannedStatement {
             schema: schema.clone(),
             ticket: StatementTicket::Result(schema, batches),
@@ -100,8 +102,8 @@ pub(crate) async fn plan_statement(ctx: &SessionContext, sql: &str) -> Result<Pl
 
 /// Run `sql` to completion and return the number of rows it affected
 /// (the `count` column DataFusion returns for DML/`COPY`; 0 for DDL).
-pub(crate) async fn execute_update(ctx: &SessionContext, sql: &str) -> Result<i64> {
-    let batches = ctx.sql(sql).await?.collect().await?;
+pub(crate) async fn execute_update(catalog: &CatalogManager, sql: &str) -> Result<i64> {
+    let (_, batches) = catalog.execute(sql).await?;
     let mut count = 0;
     for batch in &batches {
         if let Some(col) = batch.column_by_name("count") {
