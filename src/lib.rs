@@ -1,6 +1,8 @@
 pub mod datasource;
 #[cfg(feature = "distributed")]
 pub mod distributed;
+#[cfg(feature = "flightsql")]
+pub mod flightsql;
 pub mod optimizer;
 pub mod physical_plan;
 pub mod reader;

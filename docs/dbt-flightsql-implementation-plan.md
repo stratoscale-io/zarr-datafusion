@@ -265,6 +265,53 @@ uv run --with adbc-driver-flightsql --with pyarrow python scripts/flightsql_smok
 **Exit:** both test suites pass, and `adbc_driver_flightsql.dbapi` can run
 `CREATE VIEW` and `SELECT` against the server.
 
+### Status (2026-10-29, on tower): done
+
+What was built differs from the sketch above in a few places:
+- **No `auth.rs`:** auth is a tonic `Interceptor` (`BearerAuth` in
+  `flightsql/mod.rs`) in front of every call, so no handler can forget the
+  check. `do_handshake` accepts any request.
+- **Tickets carry no server state:** the statement handle is either
+  `q` + SQL (queries, planned again on `DoGet`) or `r` + an Arrow IPC stream
+  holding the already-computed DDL/DML result, so the server never stores
+  results waiting to be fetched. Statements with side effects
+  (`Ddl | Dml | Copy | Statement`) run during `GetFlightInfo`.
+- **Dictionary columns:** the Flight encoder expands dictionary columns
+  (our coordinates), so `FlightInfo` advertises the expanded schema too.
+- **Public API:** `flight_sql_service(ctx, token)` returns a tonic service to
+  add to any `Server`; there is no `serve()` wrapper.
+- `--init-sql` files are split with `DFParser`, so any number of statements
+  per file works.
+
+Tests:
+- `tests/integration_flightsql.rs` (8 tests, `--features flightsql`):
+  - a SELECT through Flight matches running it locally;
+  - the advertised schema matches the streamed one for dictionary coordinates;
+  - DDL runs exactly once;
+  - invalid SQL returns `InvalidArgument` with the DataFusion message;
+  - two clients see one catalog;
+  - `execute_update` returns row counts;
+  - bearer auth (missing / wrong / right token);
+  - `GetSqlInfo`.
+- `scripts/flightsql_smoke.py` (ADBC DB-API, run from another machine
+  through an SSH tunnel) passes:
+  - DDL through `cursor.execute`;
+  - dbt's `information_schema` relation query (`BASE TABLE` / `VIEW`);
+  - a filtered query through a view;
+  - Arrow fetch;
+  - errors and a wrong token reported cleanly.
+
+  `--init-sql` was checked by hand.
+
+Findings for Phase 4:
+- Connect with `autocommit=True`. The server has no transactions, and
+  without it ADBC warns that it cannot disable autocommit.
+- ADBC's DB-API calls `Prepare` before every `execute`. The server returns
+  `Unimplemented`, so ADBC executes directly, but every statement pays one
+  extra round trip. Supporting prepared statements (Phase 6) would remove it.
+- `SET` changes the shared session for every client, because there is one
+  `SessionContext`. That's acceptable for dbt, but worth documenting.
+
 ---
 
 ## Phase 3 — Catalog semantics: late-binding views + DDL journal

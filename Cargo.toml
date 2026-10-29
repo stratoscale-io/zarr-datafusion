@@ -46,9 +46,16 @@ serde = { version = "1.0.228", features = ["derive"] }
 datafusion-distributed = { version = "2", optional = true }
 tonic = { version = "0.14", optional = true }
 
+# Arrow Flight SQL server. Optional: only pulled in by the `flightsql` feature,
+# which also gates the `zarr-flightsql` binary.
+arrow-flight = { version = "58", features = ["flight-sql"], optional = true }
+
 [features]
 # Enables the datafusion-distributed worker/head binaries.
 distributed = ["dep:datafusion-distributed", "dep:tonic"]
+# Enables the Arrow Flight SQL server (`zarr_datafusion::flightsql`) and the
+# `zarr-flightsql` binary.
+flightsql = ["dep:arrow-flight", "dep:tonic"]
 # Enables icechunk store support (reading icechunk repos, incl. virtual chunks
 # into archival NetCDF/HDF5). Pulls the icechunk + zarrs_icechunk crate trees.
 icechunk = ["dep:icechunk", "dep:zarrs_icechunk"]
@@ -94,6 +101,16 @@ required-features = ["distributed"]
 name = "head"
 path = "src/bin/head.rs"
 required-features = ["distributed"]
+
+[[bin]]
+name = "zarr-flightsql"
+path = "src/bin/zarr_flightsql.rs"
+required-features = ["flightsql"]
+
+[[test]]
+name = "integration_flightsql"
+path = "tests/integration_flightsql.rs"
+required-features = ["flightsql"]
 
 [dependencies.rustyline]
 version = "15"
