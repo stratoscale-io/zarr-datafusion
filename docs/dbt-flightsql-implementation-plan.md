@@ -508,6 +508,58 @@ lineage graph, and supports source tests and freshness checks.
 **Exit:** `dbt debug`, `dbt run`, `dbt test`, `dbt docs generate` succeed
 against `zarr-flightsql` on the synthetic dataset.
 
+### Status (2026-10-29, tested on a Mac against a server on tower): done
+
+`integrations/dbt-zarr` (dbt-core 1.11, dbt-adapters 1.24, ADBC Flight SQL
+1.13). Changes from the sketch:
+- **No `ZarrRelation`.** dbt's default relation quoting (as in Postgres) is
+  kept, which avoids case mismatches in dbt's relation cache. Schema
+  statements are rendered unquoted (`catalog.schema`), because DataFusion
+  takes schema names as plain strings.
+- **Seeds are one statement**:
+  `CREATE OR REPLACE TABLE … AS SELECT CAST(columnN AS type) … FROM (VALUES …)`,
+  built in Python (`ZarrAdapter.seed_create_sql`), instead of
+  `CREATE EXTERNAL TABLE … STORED AS CSV`. This needs no parameter bindings,
+  works when the server can't see the project's files, and the journal
+  keeps the seed. Only the default seed materialization's helpers are
+  overridden.
+- **`incremental` moved forward from Phase 6, `append` strategy only.**
+  - First run: `CREATE OR REPLACE TABLE AS`; later runs: `INSERT … SELECT`.
+  - Inserted rows aren't journaled, so a restart rebuilds the table from its
+    full query, which amounts to a full refresh.
+- **Credentials** default `database` to `datafusion` and `schema` to
+  `public`. dbt validates profiles before `__pre_deserialize__` runs, so the
+  defaults have to be dataclass defaults.
+- **Connections** use ADBC with `autocommit=True`; dbt's `BEGIN`/`COMMIT`
+  send nothing.
+
+Results:
+- **dbt's standard adapter suite** (`tests/functional`): 11 classes pass —
+  simple materializations, including table↔view↔incremental swaps and
+  docs generate; empty; ephemeral; generic tests; singular tests, plain and
+  ephemeral; table materialization; adapter methods; validate connection;
+  incremental; incremental-not-schema-change.
+- **Unit tests** (`tests/unit`): 13 pass.
+- **A 3-model project on synthetic data** (source → view → table → view
+  joining a seed, 5 tests):
+  - `dbt build` passes 9/9, repeatedly;
+  - view↔table swaps work;
+  - `dbt docs generate` lists all nodes with Arrow column types;
+  - after a server restart, the models answer immediately from the journal.
+- **Pushdown through the dbt-built chain**: `WHERE t = 3`, where
+  `t = cast(time as bigint)` is two views down, reaches `ZarrExec` as
+  `filters=[time=3]`.
+
+**Bug found and fixed along the way (commit 059fa34):**
+- **Symptom:** `ZarrLimitPushdownRule` pushed a `LIMIT` through aggregates,
+  joins and sorts into `ZarrExec`. `dbt show`, which wraps the model in
+  `SELECT … LIMIT n`, returned 4 of 7 groups with wrong averages.
+- **Fix:**
+  - limits now only pass through row-preserving operators;
+  - they're picked up per branch instead of globally;
+  - `OFFSET` is included in the pushed limit.
+- **Tests** now check result values, not just row counts.
+
 ---
 
 ## Phase 5 — ONI example project (end-to-end acceptance)
