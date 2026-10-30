@@ -6,6 +6,9 @@
 
   The location is resolved by the server, not by dbt. Declare the same table
   in a sources .yml so `source()` and lineage work.
+
+  The table is replaced on every run, so a changed location takes effect (a
+  Zarr table holds only metadata; the server refreshes views reading it).
 #}
 
 {% macro zarr_source(name, location, schema=none) %}
@@ -13,7 +16,7 @@
   {%- if execute -%}
     {% do run_query("create schema if not exists " ~ target.database ~ "." ~ schema) %}
     {% do run_query(
-        "create external table if not exists " ~ target.database ~ "." ~ schema ~ "." ~ name
+        "create or replace external table " ~ target.database ~ "." ~ schema ~ "." ~ name
         ~ " stored as zarr location '" ~ location ~ "'") %}
   {%- endif -%}
 {% endmacro %}
