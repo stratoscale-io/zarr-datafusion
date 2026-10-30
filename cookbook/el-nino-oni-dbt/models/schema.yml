@@ -1,0 +1,39 @@
+version: 2
+
+models:
+  - name: stg_ersst_monthly
+    description: Niño-3.4 spatial-mean SST (°C) per month, from ERSST v5.
+    columns:
+      - name: sst_c
+        tests: [not_null]
+  - name: stg_era5_monthly
+    description: Niño-3.4 spatial-mean SST (°C) per month, from ERA5 (noon on the 15th).
+    columns:
+      - name: sst_c
+        tests: [not_null]
+
+  - name: int_climatology
+    description: Per-month climatology for each base-period block.
+    columns:
+      - name: clim_sst
+        tests: [not_null]
+
+  - name: int_anomaly
+    description: Monthly SST anomaly (°C) against its block's climatology.
+    columns:
+      - name: t
+        tests: [unique, not_null]
+
+  - name: fct_oni
+    description: Oceanic Niño Index per overlapping 3-month season, 1950 on.
+    columns:
+      - name: season_key
+        tests: [unique, not_null]
+      - name: oni_c
+        description: ONI in °C, rounded to 2 decimals as NOAA publishes it.
+        tests: [not_null]
+      - name: enso_phase
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['El Niño', 'La Niña', 'Neutral']

@@ -1,0 +1,21 @@
+version: 2
+
+seeds:
+  - name: noaa_oni
+    description: >
+      NOAA CPC's official ONI (oni.ascii.txt), from
+      cookbook/el-nino-oni/oni_noaa_reference.txt. `anom` is the ONI.
+    config:
+      column_types: {season: varchar, year: bigint, total: double, anom: double}
+  - name: base_periods
+    description: >
+      NOAA's centred 30-year base period for each block of season years,
+      shifting every 5 years; the last is held for 2016+ (later centred
+      periods need future data). ERA5 starts in 1940, so with ERA5 the first
+      base period (1936-1965) is effectively 1940-1965.
+    config:
+      column_types: {yr_lo: bigint, yr_hi: bigint, base_lo: bigint, base_hi: bigint}
+  - name: season_labels
+    description: Centre month of a 3-month season -> NOAA season code.
+    config:
+      column_types: {mo: bigint, season: varchar}

@@ -1,0 +1,28 @@
+version: 2
+
+# Registered by `zarr_source` in on-run-start: only the dataset selected by
+# var('sst_source') is registered and read.
+sources:
+  - name: raw
+    database: datafusion
+    schema: raw
+    tables:
+      - name: ersst
+        description: >
+          NOAA ERSST v5, monthly 2° SST (°C), as a VirtualiZarr reference over
+          the NetCDF file. Location: var `ersst_location`.
+        columns:
+          - name: time
+          - name: lat
+          - name: lon
+          - name: sst
+      - name: era5
+        description: >
+          ARCO-ERA5 hourly 0.25° reanalysis, read in place as Zarr.
+          Location: var `era5_location`.
+        columns:
+          - name: time
+          - name: latitude
+          - name: longitude
+          - name: sea_surface_temperature
+            description: Kelvin. Absent chunks read back as NaN.

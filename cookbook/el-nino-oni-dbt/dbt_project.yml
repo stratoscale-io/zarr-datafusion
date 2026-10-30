@@ -1,0 +1,33 @@
+name: el_nino_oni
+version: "1.0"
+config-version: 2
+profile: el_nino_oni
+
+vars:
+  # Which SST dataset the ONI is computed from:
+  #   ersst - NOAA ERSST v5, monthly 2°, NOAA's own ONI source (default).
+  #           Read in place from NetCDF through a VirtualiZarr reference.
+  #   era5  - ARCO-ERA5 hourly 0.25° reanalysis: an independent check.
+  sst_source: ersst
+  # Store locations, resolved by the zarr-flightsql server relative to its
+  # working directory (or gs://, s3://, https:// references).
+  ersst_location: data/ersst_v5.parq
+  era5_location: gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3
+  # Sample window. The earliest base period starts in 1936.
+  first_year: 1936
+  last_year: 2026
+
+on-run-start:
+  - "{{ zarr_source(var('sst_source'), var(var('sst_source') ~ '_location'), schema='raw') }}"
+
+models:
+  el_nino_oni:
+    +materialized: view
+    staging:
+      # --vars '{staging_materialized: table}' reads the store once per run
+      # instead of once per query or test: worth it when the store is remote.
+      # (A default here, as project vars aren't set while this file renders.)
+      +materialized: "{{ var('staging_materialized', 'view') }}"
+    intermediate:
+      int_climatology:
+        +materialized: table

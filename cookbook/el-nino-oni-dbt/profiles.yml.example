@@ -1,0 +1,11 @@
+# Copy to ~/.dbt/profiles.yml, or run dbt with --profiles-dir pointing here
+# after renaming to profiles.yml.
+el_nino_oni:
+  target: dev
+  outputs:
+    dev:
+      type: zarr
+      host: 127.0.0.1
+      port: 50051
+      schema: oni
+      threads: 4

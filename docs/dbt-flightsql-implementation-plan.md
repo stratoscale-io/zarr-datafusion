@@ -617,6 +617,42 @@ GROUP BY 1
 4. A `README.md` with the lineage graph (`dbt docs`), run instructions, and
    timings.
 
+### Status (2026-10-30, dbt on a Mac against a server on tower): done, with changes
+
+**Changed from the plan:**
+- **Two sources, picked by `var('sst_source')`.** `data/era5_sst_local.zarr`
+  holds every hour of mostly December months (DJF work), only 155
+  noon-of-the-15th samples, so it can't give the full ONI. The full ERA5 run
+  needs ARCO-ERA5 on GCS (~1 h, several GB). The default source is now ERSST
+  v5, NOAA's own ONI source, read in place from NetCDF through a VirtualiZarr
+  reference (no conversion). ERA5 has its own staging model; the rest is shared.
+- **NOAA check per source.** ERSST: every season within 0.05 °C (largest
+  difference 0.02). ERA5 can't pass a per-season 0.3 °C bound (the cookbook's
+  ERA5 residual is above 0.3 for 139 of 916 seasons, up to 0.95 in the 1970s,
+  from dataset differences), so its test checks MAE ≤ 0.2, r ≥ 0.95, and 0.4 °C
+  per season from 2000 on.
+- **`fct_oni` uses `lag`/`lead`** with a contiguity check instead of
+  `AVG() OVER (ROWS 1 PRECEDING ...)`, so a season with a missing neighbour
+  month is dropped as in the cookbook query.
+- **Adapter fix:** `zarr_source` used `CREATE EXTERNAL TABLE IF NOT EXISTS`, so
+  a changed location was silently ignored while the server kept the old table.
+  It now uses `CREATE OR REPLACE EXTERNAL TABLE`;
+  `tests/functional/test_sources.py` covers it (fails on the old macro).
+
+**Acceptance:**
+
+| Check | Result |
+|---|---|
+| 1. `dbt build` | 3 seeds, 4 models, 10 tests: all pass. ERSST from local NetCDF: ~5 s. ERSST from NOAA over HTTPS: 7 min 25 s with staging views (each test re-reads), 1 min 24 s with `staging_materialized: table` (one read). Also passes on the ERA5 mirror. |
+| Same answer | `fct_oni` identical to `oni_ersst.sql` (916 seasons) and, on the ERA5 mirror, to `oni_all_seasons.sql` (37 seasons). |
+| 2. No files written | Repo and `data/` unchanged (131,629 files by size and mtime); only the journal is written. |
+| 3. Pushdown | One month of the staging model: 0.1 MB read, same as hand-written. Full series: dbt 33 MB vs hand-written 194 MB (ERA5 mirror: 222 vs 1,317 MB), since the hand-written query inlines its CTEs and scans several times. One season on `fct_oni`: 33 MB, as `lag`/`lead` block pushdown (Phase 0 V4). |
+| Restart | Same `fct_oni` rows after a server restart, from the journal. |
+| 4. README | `cookbook/el-nino-oni-dbt/README.md`: lineage, run instructions, results. |
+
+Bytes are the server process's `rchar` (ZarrExec has no metrics in
+`EXPLAIN ANALYZE`, and zarr-cli reports only the first scan of a plan).
+
 ---
 
 ## Phase 6 — Extensions (after the minimal version, each optional)
