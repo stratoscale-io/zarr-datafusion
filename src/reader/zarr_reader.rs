@@ -407,7 +407,7 @@ fn build_projected_schema(
 /// Convert CoordValues to CoordValuesRef for filtering.
 ///
 /// This consolidates the repeated conversion logic in both sync and async paths.
-fn coord_values_to_refs(coord_values: &[CoordValues]) -> Vec<CoordValuesRef<'_>> {
+pub(crate) fn coord_values_to_refs(coord_values: &[CoordValues]) -> Vec<CoordValuesRef<'_>> {
     coord_values
         .iter()
         .map(|v| match v {

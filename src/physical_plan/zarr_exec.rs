@@ -262,6 +262,23 @@ impl ZarrExec {
         self.store_meta.as_ref()
     }
 
+    /// The scan's store, opened for async reads, and the prefix its arrays are under.
+    pub async fn open_store(
+        &self,
+    ) -> datafusion::error::Result<(AsyncReadableListableStorage, ObjectPath)> {
+        if let Some((store, prefix, _)) = &self.cached_remote {
+            return Ok((store.clone(), prefix.clone()));
+        }
+        if self.store_kind == StoreKind::Zarr && !is_remote_url(&self.path) {
+            use zarrs_object_store::object_store::local::LocalFileSystem;
+            use zarrs_object_store::AsyncObjectStore;
+            let fs = LocalFileSystem::new_with_prefix(&self.path)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            return Ok((Arc::new(AsyncObjectStore::new(fs)), ObjectPath::default()));
+        }
+        open_uncached(&self.path, self.store_kind.clone()).await
+    }
+
     /// Get this scan's partition slices (empty == single unpartitioned read).
     /// Used by the distributed codec (to ship them) and the `TaskEstimator`
     /// (to split them across worker tasks).
@@ -550,7 +567,6 @@ fn execute_remote(
     cache: Arc<ScanCache>,
 ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
     use crate::reader::async_tracked_store::AsyncTrackedStore;
-    use crate::reader::storage::create_async_store;
 
     debug!(path = %path, has_cached_remote = cached_remote.is_some(), "Setting up remote execution stream");
 
@@ -581,15 +597,7 @@ fn execute_remote(
                 (store, prefix, Some(meta))
             } else {
                 debug!("Creating async store (no cache)");
-                let (store, prefix) = match store_kind {
-                    StoreKind::Zarr => create_async_store(&path)
-                        .await
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?,
-                    StoreKind::Icechunk { group, anonymous } => (
-                        open_icechunk(&path, anonymous).await?,
-                        ObjectPath::from(group.unwrap_or_default().trim_matches('/')),
-                    ),
-                };
+                let (store, prefix) = open_uncached(&path, store_kind).await?;
                 debug!(prefix = %prefix, "Async store created");
                 (store, prefix, None)
             };
@@ -603,6 +611,22 @@ fn execute_remote(
         },
         "Remote",
     )
+}
+
+async fn open_uncached(
+    path: &str,
+    store_kind: StoreKind,
+) -> datafusion::error::Result<(AsyncReadableListableStorage, ObjectPath)> {
+    use crate::reader::storage::create_async_store;
+    match store_kind {
+        StoreKind::Zarr => create_async_store(path)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e))),
+        StoreKind::Icechunk { group, anonymous } => Ok((
+            open_icechunk(path, anonymous).await?,
+            ObjectPath::from(group.unwrap_or_default().trim_matches('/')),
+        )),
+    }
 }
 
 #[cfg(feature = "icechunk")]

@@ -69,9 +69,12 @@ async fn shape_of(ctx: &SessionContext, sql: &str) -> Result<WriteShape, RejectR
 #[tokio::test]
 async fn admits_full_projection() {
     let ctx = ctx_over_skeleton("adm_full.zarr");
-    let shape = shape_of(&ctx, "SELECT time, lat, lon, temperature, reflectance FROM t")
-        .await
-        .expect("admissible");
+    let shape = shape_of(
+        &ctx,
+        "SELECT time, lat, lon, temperature, reflectance FROM t",
+    )
+    .await
+    .expect("admissible");
     assert_eq!(shape.grid_axes, vec!["time", "lat", "lon"]);
     assert!(!shape.is_reduce);
     let vars: Vec<(&str, WriteDataType)> = shape
@@ -87,12 +90,9 @@ async fn admits_full_projection() {
 async fn admits_transform_projection() {
     // A derived variable is a new data var; the grid is unchanged (§5.7).
     let ctx = ctx_over_skeleton("adm_transform.zarr");
-    let shape = shape_of(
-        &ctx,
-        "SELECT time, lat, lon, temperature * 2 AS t2 FROM t",
-    )
-    .await
-    .expect("admissible");
+    let shape = shape_of(&ctx, "SELECT time, lat, lon, temperature * 2 AS t2 FROM t")
+        .await
+        .expect("admissible");
     assert_eq!(shape.grid_axes, vec!["time", "lat", "lon"]);
     assert!(!shape.is_reduce);
     assert_eq!(shape.data_vars.len(), 1);
@@ -209,9 +209,13 @@ const SRC: &str = "data/synthetic_rt_v3.zarr";
 async fn materialise_full_copy_spec() {
     let ctx = create_baseline_context();
     register_zarr_table(&ctx, "src", SRC);
-    let plan = plan_of(&ctx, "SELECT time, lat, lon, temperature, reflectance FROM src").await;
+    let plan = plan_of(
+        &ctx,
+        "SELECT time, lat, lon, temperature, reflectance FROM src",
+    )
+    .await;
 
-    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).expect("materialise");
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).await.expect("materialise");
 
     // Grid axes carry the source coordinate values, in dimension order.
     let grid: Vec<(String, usize)> = spec
@@ -246,10 +250,21 @@ async fn materialise_subset_gathers_coordinates() {
     let ctx = create_baseline_context();
     register_zarr_table(&ctx, "src", SRC);
     // lat is arange(10); `lat < 5` narrows the grid to five points, other axes full.
-    let plan = plan_of(&ctx, "SELECT time, lat, lon, temperature FROM src WHERE lat < 5").await;
+    let plan = plan_of(
+        &ctx,
+        "SELECT time, lat, lon, temperature FROM src WHERE lat < 5",
+    )
+    .await;
 
-    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).expect("materialise");
-    let axis = |n: &str| spec.coords.iter().find(|c| c.name == n).unwrap().values.len();
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).await.expect("materialise");
+    let axis = |n: &str| {
+        spec.coords
+            .iter()
+            .find(|c| c.name == n)
+            .unwrap()
+            .values
+            .len()
+    };
     assert_eq!(axis("lat"), 5, "lat narrowed to the subset");
     assert_eq!(axis("time"), 7, "time unfiltered");
     assert_eq!(axis("lon"), 12, "lon unfiltered");
@@ -263,9 +278,13 @@ async fn materialise_subset_gathers_coordinates() {
 async fn copy_roundtrips(src: &str, tag: &str) {
     let ctx = create_baseline_context();
     register_zarr_table(&ctx, "src", src);
-    let plan = plan_of(&ctx, "SELECT time, lat, lon, temperature, reflectance FROM src").await;
+    let plan = plan_of(
+        &ctx,
+        "SELECT time, lat, lon, temperature, reflectance FROM src",
+    )
+    .await;
 
-    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).expect("materialise");
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).await.expect("materialise");
     let target = scratch(tag);
     create_skeleton(&target, &spec).expect("create target");
 
@@ -314,11 +333,15 @@ use zarr_datafusion::writer::zarr_write_exec;
 async fn data_sink_writes_a_store_as_an_execution_plan() {
     let ctx = create_baseline_context();
     register_zarr_table(&ctx, "src", SRC);
-    let plan = plan_of(&ctx, "SELECT time, lat, lon, temperature, reflectance FROM src").await;
+    let plan = plan_of(
+        &ctx,
+        "SELECT time, lat, lon, temperature, reflectance FROM src",
+    )
+    .await;
 
     // Derive the spec at plan time (not from the stream), then wrap the input in a
     // sink node. Executing the node creates the skeleton and writes the store.
-    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).expect("materialise");
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).await.expect("materialise");
     let target = scratch("datasink_copy.zarr");
     let exec = zarr_write_exec(plan, target.clone(), spec, 3); // 3 write partitions
 
@@ -363,7 +386,12 @@ async fn copy_to_writes_a_zarr_store_from_sql() {
         "COPY (SELECT * FROM src) TO '{target}' \
          STORED AS ZARR OPTIONS ('chunks' '1,4,5', 'partitions' '3')"
     );
-    ctx.sql(&sql).await.expect("plan COPY").collect().await.expect("run COPY");
+    ctx.sql(&sql)
+        .await
+        .expect("plan COPY")
+        .collect()
+        .await
+        .expect("run COPY");
 
     // The store the SQL produced must match the source.
     let tgt = create_baseline_context();
@@ -387,7 +415,12 @@ async fn copy_to_defaults_chunks_from_source() {
 
     let target = scratch("copyto_defaultchunks.zarr");
     let sql = format!("COPY (SELECT * FROM src) TO '{target}' STORED AS ZARR");
-    ctx.sql(&sql).await.expect("plan").collect().await.expect("run");
+    ctx.sql(&sql)
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("run");
 
     let tgt = create_baseline_context();
     register_zarr_table(&tgt, "t", &target);
@@ -395,4 +428,152 @@ async fn copy_to_defaults_chunks_from_source() {
         scalar_i64(&ctx, "SELECT SUM(temperature) FROM src").await,
         scalar_i64(&tgt, "SELECT SUM(temperature) FROM t").await,
     );
+}
+
+// --- periodic keys --------------------------------------------------------
+
+/// Six monthly timestamps, January to June 2020 at 12:00, over one cell, with
+/// temperature 0, 10, … 50.
+const MONTHLY: &str = "data/monthly_v3.zarr";
+
+const MONTH: &str = "date_part('month', CAST(time AS TIMESTAMP))";
+
+fn ctx_over_monthly() -> SessionContext {
+    let ctx = create_baseline_context();
+    register_zarr_table(&ctx, "t", MONTHLY);
+    ctx
+}
+
+#[tokio::test]
+async fn admits_a_periodic_key_as_an_axis_of_its_own() {
+    let ctx = ctx_over_monthly();
+    let shape = shape_of(
+        &ctx,
+        &format!(
+            "SELECT lat, lon, {MONTH} AS month, AVG(temperature) AS mean \
+             FROM t GROUP BY lat, lon, {MONTH}"
+        ),
+    )
+    .await
+    .expect("admissible");
+    assert_eq!(shape.grid_axes, vec!["month", "lat", "lon"]);
+    assert_eq!(
+        shape.grid_axis_field,
+        vec![Some("month".to_string()), None, None]
+    );
+    assert_eq!(shape.data_vars.len(), 1);
+    assert_eq!(shape.data_vars[0].name, "mean");
+}
+
+#[tokio::test]
+async fn names_a_key_axis_by_its_output_column() {
+    let ctx = ctx_over_monthly();
+    let shape = shape_of(
+        &ctx,
+        "SELECT lat AS y, lon AS x, AVG(temperature) AS mean FROM t GROUP BY lat, lon",
+    )
+    .await
+    .expect("admissible");
+    assert_eq!(shape.grid_axes, vec!["y", "x"]);
+    assert_eq!(shape.data_vars[0].name, "mean");
+}
+
+#[tokio::test]
+async fn rejects_a_key_missing_from_the_output() {
+    let ctx = ctx_over_monthly();
+    let err = shape_of(
+        &ctx,
+        "SELECT lat, AVG(temperature) AS mean FROM t GROUP BY lat, lon",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, RejectReason::KeyNotInOutput("lon".to_string()));
+}
+
+/// `(key, value)` pairs of a two-column query, NaN values dropped.
+async fn pairs(ctx: &SessionContext, sql: &str) -> Vec<(i64, f64)> {
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let mut pairs = Vec::new();
+    for b in &batches {
+        let keys = arrow::compute::cast(b.column(0), &arrow::datatypes::DataType::Int64).unwrap();
+        let keys = keys
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let values = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        for i in 0..b.num_rows() {
+            if !values.value(i).is_nan() {
+                pairs.push((keys.value(i), values.value(i)));
+            }
+        }
+    }
+    pairs.sort_by_key(|(k, _)| *k);
+    pairs
+}
+
+#[tokio::test]
+async fn copy_to_writes_a_periodic_axis_over_its_whole_range() {
+    let ctx = ctx_over_monthly();
+    register_zarr_write_format(&ctx).expect("register format");
+
+    for (field, chunks, cells, values) in [
+        (
+            "month",
+            "12,1,1",
+            12,
+            (1..=6).zip([0.0, 10.0, 20.0, 30.0, 40.0, 50.0]).collect(),
+        ),
+        ("hour", "24,1,1", 24, vec![(12, 25.0)]),
+    ] {
+        let key = format!("date_part('{field}', CAST(time AS TIMESTAMP))");
+        let query = format!(
+            "SELECT lat, lon, {key} AS {field}, AVG(temperature) AS mean \
+             FROM t GROUP BY lat, lon, {key}"
+        );
+        let target = scratch(&format!("copyto_{field}.zarr"));
+        let sql =
+            format!("COPY ({query}) TO '{target}' STORED AS ZARR OPTIONS ('chunks' '{chunks}')");
+        ctx.sql(&sql)
+            .await
+            .expect("plan COPY")
+            .collect()
+            .await
+            .expect("run COPY");
+
+        let tgt = create_baseline_context();
+        register_zarr_table(&tgt, "c", &target);
+        let all = scalar_i64(&tgt, "SELECT COUNT(*) FROM c").await;
+        assert_eq!(all, cells, "{field}: cells");
+        let written = pairs(&tgt, &format!("SELECT {field}, mean FROM c")).await;
+        assert_eq!(written, values, "{field}: values");
+    }
+}
+
+#[tokio::test]
+async fn copy_to_filters_on_a_cf_time_as_the_reader_does() {
+    // time is stored as days since 2020-01-15, mid-month
+    let ctx = ctx_over_monthly();
+    register_zarr_write_format(&ctx).expect("register format");
+    let query = format!(
+        "SELECT lat, lon, {MONTH} AS month, AVG(temperature) AS mean FROM t \
+         WHERE time >= TIMESTAMP '2020-03-01' AND time < TIMESTAMP '2020-05-01' \
+         GROUP BY lat, lon, {MONTH}"
+    );
+    let target = scratch("copyto_time_filter.zarr");
+    let sql = format!("COPY ({query}) TO '{target}' STORED AS ZARR OPTIONS ('chunks' '12,1,1')");
+    ctx.sql(&sql)
+        .await
+        .expect("plan COPY")
+        .collect()
+        .await
+        .expect("run COPY");
+
+    let tgt = create_baseline_context();
+    register_zarr_table(&tgt, "c", &target);
+    let written = pairs(&tgt, "SELECT month, mean FROM c").await;
+    assert_eq!(written, vec![(3, 20.0), (4, 30.0)]);
 }

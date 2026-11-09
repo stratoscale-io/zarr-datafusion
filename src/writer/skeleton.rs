@@ -20,15 +20,17 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use zarrs::array::codec::bytes_to_bytes::blosc::{
     BloscCompressionLevel, BloscCompressor, BloscShuffleMode,
 };
 use zarrs::array::codec::BloscCodec;
 use zarrs::array::{ArrayBuilder, DataType, FillValue};
-use zarrs::filesystem::FilesystemStore;
 use zarrs::group::GroupBuilder;
 use tracing::{debug, info};
+
+use super::store::open_target;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -36,7 +38,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 ///
 /// Deliberately narrow: these are the types the round-trip fixture and the
 /// first real target (NDVI) need. Widen when a consumer needs more.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WriteDataType {
     Int64,
     Float32,
@@ -117,7 +119,7 @@ impl WriteDataType {
 }
 
 /// Values of one coordinate axis, dense and in index order.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CoordValues {
     Int64(Vec<i64>),
     Float64(Vec<f64>),
@@ -146,7 +148,7 @@ impl CoordValues {
 }
 
 /// A coordinate array: a 1-D axis, stored as a single chunk.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoordSpec {
     pub name: String,
     pub values: CoordValues,
@@ -164,11 +166,12 @@ impl CoordSpec {
 }
 
 /// An n-D data variable: metadata now, chunks later.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataVarSpec {
     pub name: String,
     pub data_type: WriteDataType,
     /// Hole marker. `None` takes [`WriteDataType::default_fill_value`].
+    #[serde(with = "fill_value_bytes")]
     pub fill_value: Option<FillValue>,
     pub attributes: Map<String, Value>,
 }
@@ -196,8 +199,22 @@ impl DataVarSpec {
     }
 }
 
+/// A fill value as its native-endian bytes.
+mod fill_value_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use zarrs::array::FillValue;
+
+    pub fn serialize<S: Serializer>(fill: &Option<FillValue>, s: S) -> Result<S::Ok, S::Error> {
+        fill.as_ref().map(|f| f.as_ne_bytes().to_vec()).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<FillValue>, D::Error> {
+        Ok(Option::<Vec<u8>>::deserialize(d)?.map(FillValue::new))
+    }
+}
+
 /// The full description of a target store.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkeletonSpec {
     /// Dimension order. Every data variable spans these axes in this order.
     pub coords: Vec<CoordSpec>,
@@ -292,7 +309,7 @@ fn blosc(type_size: usize) -> Result<BloscCodec, BoxError> {
 pub fn create_skeleton(store_path: &str, spec: &SkeletonSpec) -> Result<(), BoxError> {
     spec.validate()?;
 
-    let store = Arc::new(FilesystemStore::new(store_path)?);
+    let store = open_target(store_path)?;
     let shape = spec.shape();
     let dimension_names = spec.dimension_names();
 

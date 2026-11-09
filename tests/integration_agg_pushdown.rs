@@ -352,6 +352,20 @@ async fn periodic_group_by_enables_a_query_datafusion_cannot_run() {
 }
 
 #[tokio::test]
+async fn periodic_group_by_of_a_cast_time_is_pushed_with_the_same_answer() {
+    let sql = "SELECT date_part('month', CAST(time AS TIMESTAMP)) AS m, SUM(temperature) AS s \
+               FROM t GROUP BY date_part('month', CAST(time AS TIMESTAMP)) ORDER BY m";
+    let ctx = ctx_pushdown();
+    register_zarr_table(&ctx, "t", MONTHLY);
+    let plan = get_physical_plan(&ctx, sql).await;
+    assert!(contains_node::<ZarrAggregateExec>(&plan));
+
+    let baseline = run_on(&SessionContext::new(), MONTHLY, sql).await;
+    let pushed = run_on(&ctx_pushdown(), MONTHLY, sql).await;
+    assert_eq!(baseline, pushed);
+}
+
+#[tokio::test]
 async fn periodic_group_single_month_matches_global() {
     // era5_v3 is entirely January, so GROUP BY month yields one group whose aggregates
     // equal the (baseline-valid) global aggregate — a cross-check on real data.

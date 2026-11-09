@@ -32,19 +32,21 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 
 use super::skeleton::{create_skeleton, SkeletonSpec};
-use super::sink::{write_batches, write_batches_partitioned};
+use super::sink::{write_batches, write_batches_partitioned, write_chunks};
 
 /// A DataFusion sink that writes its input stream into a Zarr store.
 ///
 /// Holds the fully-derived target spec; execution creates the skeleton and writes
-/// the data-variable chunks.
-#[derive(Debug)]
+/// the data-variable chunks, or with [`writing_chunks`](Self::writing_chunks),
+/// writes only the chunks its rows fall in to a skeleton created beforehand.
+#[derive(Debug, Clone)]
 pub struct ZarrDataSink {
     store_path: String,
     spec: SkeletonSpec,
     input_schema: SchemaRef,
     /// Chunk-aligned write partitions (Phase 5). `1` is the single-writer path.
     target_partitions: usize,
+    writes_chunks: bool,
 }
 
 impl ZarrDataSink {
@@ -59,7 +61,32 @@ impl ZarrDataSink {
             spec,
             input_schema,
             target_partitions: target_partitions.max(1),
+            writes_chunks: false,
         }
+    }
+
+    /// This sink, writing only the chunks its rows fall in, to a store already
+    /// created from its spec, as several sinks whose rows fall in different
+    /// chunks can between them.
+    pub fn writing_chunks(mut self) -> Self {
+        self.writes_chunks = true;
+        self
+    }
+
+    pub fn writes_chunks(&self) -> bool {
+        self.writes_chunks
+    }
+
+    pub fn store_path(&self) -> &str {
+        &self.store_path
+    }
+
+    pub fn spec(&self) -> &SkeletonSpec {
+        &self.spec
+    }
+
+    pub fn target_partitions(&self) -> usize {
+        self.target_partitions
     }
 }
 
@@ -67,10 +94,11 @@ impl DisplayAs for ZarrDataSink {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "ZarrDataSink(path={}, vars={}, partitions={})",
+            "ZarrDataSink(path={}, vars={}, partitions={}{})",
             self.store_path,
             self.spec.data_vars.len(),
             self.target_partitions,
+            if self.writes_chunks { ", chunks" } else { "" },
         )
     }
 }
@@ -96,8 +124,12 @@ impl DataSink for ZarrDataSink {
         let store_path = self.store_path.clone();
         let spec = self.spec.clone();
         let parts = self.target_partitions;
+        let writes_chunks = self.writes_chunks;
 
         tokio::task::spawn_blocking(move || {
+            if writes_chunks {
+                return write_chunks(&store_path, &spec, batches);
+            }
             create_skeleton(&store_path, &spec)?;
             if parts > 1 {
                 write_batches_partitioned(&store_path, &spec, batches, parts)

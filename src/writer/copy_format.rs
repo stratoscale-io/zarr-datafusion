@@ -174,7 +174,7 @@ impl FileFormat for ZarrFileFormat {
             })?,
         };
 
-        let spec = derive_skeleton_spec(&input, chunks).map_err(DataFusionError::External)?;
+        let spec = derive_skeleton_spec(&input, chunks).await.map_err(DataFusionError::External)?;
         Ok(zarr_write_exec(input, target, spec, self.partitions))
     }
 

@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result, ScalarValue, TableReference};
+use datafusion::datasource::sink::DataSinkExec;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Extension, LogicalPlan};
@@ -34,6 +35,7 @@ use crate::physical_plan::partition::PartitionSpec;
 use crate::physical_plan::zarr_exec::{StoreKind, ZarrExec};
 use crate::reader::filter::{CoordFilterKind, CoordFilters};
 use crate::reader::schema_inference::ZarrStoreMeta;
+use crate::writer::{SkeletonSpec, ZarrDataSink};
 
 // =============================================================================
 // ScalarValue / Schema <-> bytes, via datafusion-proto's protobuf conversions
@@ -242,9 +244,24 @@ impl ZarrExecDto {
 // PhysicalExtensionCodec
 // =============================================================================
 
-/// Encodes/decodes [`ZarrExec`] for datafusion-distributed. Register this on the
-/// head and every worker (via `with_distributed_user_codec`) so both sides agree
-/// on the wire format.
+/// A [`DataSinkExec`] writing through a [`ZarrDataSink`]; its input travels as
+/// the node's child, and supplies the sink's schema.
+#[derive(Serialize, Deserialize)]
+struct ZarrSinkDto {
+    zarr_sink: ZarrSinkFields,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ZarrSinkFields {
+    store_path: String,
+    spec: SkeletonSpec,
+    target_partitions: usize,
+    writes_chunks: bool,
+}
+
+/// Encodes/decodes [`ZarrExec`], and a [`DataSinkExec`] over a [`ZarrDataSink`],
+/// for datafusion-distributed. Register this on the head and every worker (via
+/// `with_distributed_user_codec`) so both sides agree on the wire format.
 #[derive(Debug, Default)]
 pub struct ZarrPhysicalCodec;
 
@@ -252,15 +269,50 @@ impl PhysicalExtensionCodec for ZarrPhysicalCodec {
     fn try_decode(
         &self,
         buf: &[u8],
-        _inputs: &[Arc<dyn ExecutionPlan>],
+        inputs: &[Arc<dyn ExecutionPlan>],
         _ctx: &TaskContext,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if let Ok(ZarrSinkDto { zarr_sink: f }) = serde_json::from_slice(buf) {
+            let [input] = inputs else {
+                return Err(DataFusionError::Internal(
+                    "a Zarr sink takes one input".to_string(),
+                ));
+            };
+            let sink = ZarrDataSink::new(f.store_path, f.spec, input.schema(), f.target_partitions);
+            let sink = if f.writes_chunks {
+                sink.writing_chunks()
+            } else {
+                sink
+            };
+            return Ok(Arc::new(DataSinkExec::new(
+                input.clone(),
+                Arc::new(sink),
+                None,
+            )));
+        }
         let dto: ZarrExecDto = serde_json::from_slice(buf)
             .map_err(|e| DataFusionError::Internal(format!("decode ZarrExecDto: {e}")))?;
         Ok(Arc::new(dto.into_exec()?))
     }
 
     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
+        let sink = node
+            .downcast_ref::<DataSinkExec>()
+            .and_then(|exec| exec.sink().downcast_ref::<ZarrDataSink>());
+        if let Some(sink) = sink {
+            let dto = ZarrSinkDto {
+                zarr_sink: ZarrSinkFields {
+                    store_path: sink.store_path().to_string(),
+                    spec: sink.spec().clone(),
+                    target_partitions: sink.target_partitions(),
+                    writes_chunks: sink.writes_chunks(),
+                },
+            };
+            let bytes = serde_json::to_vec(&dto)
+                .map_err(|e| DataFusionError::Internal(format!("encode ZarrSinkDto: {e}")))?;
+            buf.extend_from_slice(&bytes);
+            return Ok(());
+        }
         let exec = node
             .downcast_ref::<ZarrExec>()
             .ok_or_else(|| DataFusionError::Internal("not a ZarrExec".to_string()))?;
@@ -409,6 +461,56 @@ mod tests {
             ]),
         );
         filters
+    }
+
+    #[test]
+    fn roundtrip_preserves_a_zarr_sink() {
+        use crate::writer::{CoordSpec, CoordValues, DataVarSpec, WriteDataType};
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::prelude::SessionContext;
+        use datafusion_proto::bytes::{
+            physical_plan_from_bytes_with_extension_codec,
+            physical_plan_to_bytes_with_extension_codec,
+        };
+        use zarrs::array::FillValue;
+
+        let mut var = DataVarSpec::new("clim", WriteDataType::Float32);
+        var.fill_value = Some(FillValue::from(-1.0f32));
+        let spec = SkeletonSpec::new(
+            vec![
+                CoordSpec::new("hour", CoordValues::Int64((0..24).collect())),
+                CoordSpec::new("lat", CoordValues::Float64(vec![90.0, 89.75])),
+            ],
+            vec![var],
+            vec![24, 12],
+        );
+        let input = Arc::new(EmptyExec::new(sample_schema()));
+        let sink = ZarrDataSink::new("/out.zarr", spec, input.schema(), 3).writing_chunks();
+        let exec = Arc::new(DataSinkExec::new(input, Arc::new(sink), None));
+
+        let bytes = physical_plan_to_bytes_with_extension_codec(exec, &ZarrPhysicalCodec).unwrap();
+        let ctx = SessionContext::new();
+        let decoded = physical_plan_from_bytes_with_extension_codec(
+            &bytes,
+            &ctx.task_ctx(),
+            &ZarrPhysicalCodec,
+        )
+        .unwrap();
+
+        let exec = decoded.downcast_ref::<DataSinkExec>().expect("a sink");
+        assert_eq!(exec.input().schema(), sample_schema());
+        let sink = exec
+            .sink()
+            .downcast_ref::<ZarrDataSink>()
+            .expect("a Zarr sink");
+        assert_eq!(sink.store_path(), "/out.zarr");
+        assert!(sink.writes_chunks());
+        assert_eq!(sink.target_partitions(), 3);
+        let spec = sink.spec();
+        assert_eq!(spec.chunks, vec![24, 12]);
+        assert_eq!(spec.coords[0].name, "hour");
+        assert_eq!(spec.coords[1].values.len(), 2);
+        assert_eq!(spec.data_vars[0].fill_value, Some(FillValue::from(-1.0f32)));
     }
 
     #[test]
