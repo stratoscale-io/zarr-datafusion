@@ -585,3 +585,31 @@ async fn copy_to_filters_on_a_cf_time_as_the_reader_does() {
     let written = pairs(&tgt, "SELECT month, mean FROM c").await;
     assert_eq!(written, vec![(3, 20.0), (4, 30.0)]);
 }
+
+#[tokio::test]
+async fn copy_to_writes_a_cf_time_axis_that_reads_back_as_the_same_times() {
+    // time is stored as days since 2020-01-15; the rows carry decoded timestamps
+    let ctx = ctx_over_monthly();
+    register_zarr_write_format(&ctx).expect("register format");
+    let query = "SELECT time, lat, lon, AVG(temperature) AS mean FROM t GROUP BY time, lat, lon";
+    let target = scratch("copyto_cf_time.zarr");
+    ctx.sql(&format!("COPY ({query}) TO '{target}' STORED AS ZARR"))
+        .await
+        .expect("plan COPY")
+        .collect()
+        .await
+        .expect("run COPY");
+
+    let attrs = |store: &str| {
+        let meta = std::fs::read_to_string(format!("{store}/time/zarr.json")).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        meta["attributes"].clone()
+    };
+    assert_eq!(attrs(&target)["units"], attrs(MONTHLY)["units"]);
+    let tgt = create_baseline_context();
+    register_zarr_table(&tgt, "c", &target);
+    assert_eq!(
+        pairs(&tgt, "SELECT time, AVG(mean) FROM c GROUP BY time").await,
+        pairs(&ctx, "SELECT time, AVG(temperature) FROM t GROUP BY time").await,
+    );
+}

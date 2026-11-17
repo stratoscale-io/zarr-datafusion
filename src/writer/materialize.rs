@@ -162,7 +162,8 @@ pub async fn materialize_spec(
     };
 
     // Build the target grid axes, gathered by selection where present. A periodic
-    // axis spans its field's whole range, whatever the selection.
+    // axis spans its field's whole range, whatever the selection. A source axis
+    // keeps its stored values, so a CF time keeps its units and calendar too.
     let grid_coords: Vec<CoordSpec> = shape
         .grid_axis_source
         .iter()
@@ -178,7 +179,20 @@ pub async fn materialize_spec(
                 (None, Some(sels)) => gather(&coords[src], &sels[src]),
                 (None, None) => coords[src].clone(),
             };
-            Ok(CoordSpec::new(name.clone(), values))
+            let mut coord = CoordSpec::new(name.clone(), values);
+            if let (None, Some(cf)) = (field, &meta.coords[src].cf_time_attrs) {
+                if cf.is_time_coordinate() {
+                    coord
+                        .attributes
+                        .insert("units".into(), cf.units.clone().into());
+                    if let Some(calendar) = &cf.calendar {
+                        coord
+                            .attributes
+                            .insert("calendar".into(), calendar.clone().into());
+                    }
+                }
+            }
+            Ok(coord)
         })
         .collect::<Result<_, BoxError>>()?;
 
