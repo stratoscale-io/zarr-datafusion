@@ -333,20 +333,26 @@ def generate_era5_all_variations(
     # Step 3: Write all 4 variations
     # v2 without codecs
     path = get_store_path("era5", 2, False)
-    encoding = {var: {"compressor": None} for var in all_vars}
+    encoding = {var: {"compressors": None} for var in all_vars}
     data.to_zarr(str(path), mode="w", zarr_format=2, encoding=encoding)
     print(f"  Written: {path} (v2, no codecs)")
 
     # v2 with Blosc/LZ4
     path = get_store_path("era5", 2, True)
-    encoding = {var: {"compressor": BLOSC_LZ4} for var in all_vars}
+    encoding = {var: {"compressors": BLOSC_LZ4} for var in all_vars}
     data.to_zarr(str(path), mode="w", zarr_format=2, encoding=encoding)
     print(f"  Written: {path} (v2, Blosc/LZ4)")
+
+    # The data was reloaded from a v2 store, so each variable carries v2-only
+    # encoding (compressor/filters) that the v3 backend rejects. Strip it.
+    data_v3 = data.copy(deep=False)
+    for var in all_vars:
+        data_v3[var].encoding = {}
 
     # v3 without codecs
     path = get_store_path("era5", 3, False)
     encoding = {var: {} for var in all_vars}
-    data.to_zarr(str(path), mode="w", zarr_format=3, encoding=encoding)
+    data_v3.to_zarr(str(path), mode="w", zarr_format=3, encoding=encoding)
     print(f"  Written: {path} (v3, no codecs)")
 
     # v3 with Blosc/LZ4
@@ -355,7 +361,7 @@ def generate_era5_all_variations(
         var: {"compressors": BloscCodec(cname="lz4", clevel=5, shuffle="shuffle")}
         for var in all_vars
     }
-    data.to_zarr(str(path), mode="w", zarr_format=3, encoding=encoding)
+    data_v3.to_zarr(str(path), mode="w", zarr_format=3, encoding=encoding)
     print(f"  Written: {path} (v3, Blosc/LZ4)")
 
     # Step 4: Cleanup
