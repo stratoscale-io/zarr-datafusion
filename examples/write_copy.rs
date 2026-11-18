@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .create_physical_plan()
         .await?;
 
-    let spec = derive_skeleton_spec(&plan, chunks.clone()).await?;
+    let spec = derive_skeleton_spec(&plan, chunks.clone(), ctx.task_ctx()).await?;
     create_skeleton(target, &spec)?;
     let batches = collect(plan, ctx.task_ctx()).await?;
     let rows = write_batches(target, &spec, batches)?;
