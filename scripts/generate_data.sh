@@ -11,4 +11,4 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
 echo "Generating synthetic weather data + ERA5 data..."
-uv run --with zarr --with numpy --with xarray --with gcsfs --with dask --with numcodecs "$SCRIPT_DIR/data_gen.py"
+uv run --python 3.12 --with zarr --with numpy --with xarray --with gcsfs --with dask --with numcodecs "$SCRIPT_DIR/data_gen.py"
