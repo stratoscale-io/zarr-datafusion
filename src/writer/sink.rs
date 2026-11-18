@@ -45,9 +45,9 @@ use zarrs::array::Array;
 use zarrs::array::ArraySubset;
 use zarrs::storage::{ReadableWritableListableStorage, ReadableWritableListableStorageTraits};
 
-use crate::physical_plan::partition::plan_partitions;
 use super::skeleton::{CoordValues, SkeletonSpec, WriteDataType};
 use super::store::open_target;
+use crate::physical_plan::partition::plan_partitions;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -378,10 +378,11 @@ pub fn write_batches_partitioned(
     let batches: Vec<RecordBatch> = batches.into_iter().collect();
 
     let store = open_target(store_path)?;
-    let ranges: Vec<(usize, usize)> = plan_partitions(shape[0] as u64, spec.chunks[0], target_partitions)
-        .iter()
-        .filter_map(|p| p.as_range())
-        .collect();
+    let ranges: Vec<(usize, usize)> =
+        plan_partitions(shape[0] as u64, spec.chunks[0], target_partitions)
+            .iter()
+            .filter_map(|p| p.as_range())
+            .collect();
 
     // Each closure borrows shared, immutable state and writes a disjoint slab.
     let results: Vec<Result<u64, String>> = std::thread::scope(|scope| {
@@ -398,7 +399,10 @@ pub fn write_batches_partitioned(
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Err("writer thread panicked".into())))
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err("writer thread panicked".into()))
+            })
             .collect()
     });
 

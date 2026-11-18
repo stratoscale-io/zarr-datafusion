@@ -37,15 +37,18 @@ fn describe(batch: &RecordBatch) -> String {
                 DataType::Dictionary(k, _) => match **k {
                     DataType::Int16 => col
                         .as_any()
-                        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int16Type>>()
+                        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int16Type>>(
+                        )
                         .map(|d| d.values().len()),
                     DataType::Int32 => col
                         .as_any()
-                        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>()
+                        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>(
+                        )
                         .map(|d| d.values().len()),
                     DataType::Int64 => col
                         .as_any()
-                        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int64Type>>()
+                        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int64Type>>(
+                        )
                         .map(|d| d.values().len()),
                     _ => None,
                 },
@@ -132,7 +135,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await;
 
-    scenario(&ctx, "limit: slices the batch", "SELECT time, lat, lon FROM rt LIMIT 5").await;
+    scenario(
+        &ctx,
+        "limit: slices the batch",
+        "SELECT time, lat, lon FROM rt LIMIT 5",
+    )
+    .await;
 
     scenario(
         &ctx,

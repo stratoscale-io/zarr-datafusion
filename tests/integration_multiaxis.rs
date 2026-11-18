@@ -82,7 +82,11 @@ async fn nd_fan_out_is_value_transparent() {
 
     let fanned = ctx_with_target(24);
     register_zarr_table(&fanned, "era5", ERA5_V3);
-    let plan = get_physical_plan(&fanned, "SELECT temperature FROM era5 WHERE longitude = 0.0").await;
+    let plan = get_physical_plan(
+        &fanned,
+        "SELECT temperature FROM era5 WHERE longitude = 0.0",
+    )
+    .await;
     let boxes = find_zarr_exec(&plan).unwrap();
     assert!(
         boxes.partitions().iter().any(|p| p.extra.len() >= 2),
@@ -109,7 +113,11 @@ async fn fan_out_is_value_transparent() {
     let fanned = ctx_with_target(8);
     register_zarr_table(&fanned, "era5", ERA5_V3);
     // Confirm the fanned plan really is multi-partition on this query.
-    let plan = get_physical_plan(&fanned, "SELECT temperature FROM era5 WHERE longitude = 0.0").await;
+    let plan = get_physical_plan(
+        &fanned,
+        "SELECT temperature FROM era5 WHERE longitude = 0.0",
+    )
+    .await;
     let n = find_zarr_exec(&plan).unwrap().partitions().len();
     assert!(n > 3, "expected inner fan-out (>3 partitions), got {n}");
 

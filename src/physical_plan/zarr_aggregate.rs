@@ -62,9 +62,11 @@ impl Acc {
     fn finalize_one(&self, kind: AggKind) -> ArrayRef {
         match kind {
             AggKind::Count => Arc::new(Int64Array::from(vec![self.count as i64])),
-            AggKind::Sum => Arc::new(Float64Array::from(vec![(self.count > 0).then_some(self.sum)])),
+            AggKind::Sum => Arc::new(Float64Array::from(vec![
+                (self.count > 0).then_some(self.sum)
+            ])),
             AggKind::Avg => Arc::new(Float64Array::from(vec![
-                (self.count > 0).then(|| self.sum / self.count as f64),
+                (self.count > 0).then(|| self.sum / self.count as f64)
             ])),
             AggKind::Min => Arc::new(Float64Array::from(vec![self.min])),
             AggKind::Max => Arc::new(Float64Array::from(vec![self.max])),
@@ -170,7 +172,9 @@ impl ZarrAggregateExec {
 
         // Global (no GROUP BY): one accumulator set, no per-row keying.
         if self.group_exprs.is_empty() {
-            let group = groups.get_mut(&Vec::new()).expect("global group pre-inserted");
+            let group = groups
+                .get_mut(&Vec::new())
+                .expect("global group pre-inserted");
             for (i, spec) in self.aggs.iter().enumerate() {
                 for row in 0..batch.num_rows() {
                     Self::fold_cell(&mut group[i], spec.kind, agg_cols[i].as_ref(), row);
@@ -238,9 +242,13 @@ impl ZarrAggregateExec {
                 // No groups (e.g. empty grouped selection): an empty column.
                 spec.kind.empty_array()
             } else {
-                arrow::compute::concat(&refs).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+                arrow::compute::concat(&refs)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
             };
-            columns.push(cast_to(&natural, self.schema.field(n_group + i).data_type())?);
+            columns.push(cast_to(
+                &natural,
+                self.schema.field(n_group + i).data_type(),
+            )?);
         }
 
         RecordBatch::try_new(self.schema.clone(), columns)
