@@ -11,7 +11,6 @@
 //! write" (the Q1 concern in the plan discussion).
 //!
 //! **Scope of this cut:**
-//! - **Local sources only.** Coordinate arrays are read from a `FilesystemStore`.
 //! - **Coordinate values widen to Int64 / Float64.** A source `float32`/`int32`
 //!   coordinate is written back at 64-bit width — lossless in value (every f32 is
 //!   an exact f64), but the target coordinate's *dtype* differs from the source's.
@@ -25,12 +24,18 @@ use std::sync::Arc;
 
 use zarrs::array::Array;
 use zarrs::array::ArraySubset;
-use zarrs::filesystem::FilesystemStore;
+use zarrs::storage::AsyncReadableListableStorage;
+use zarrs_object_store::object_store::path::Path as ObjectPath;
 
 use datafusion::physical_plan::ExecutionPlan;
 
-use crate::reader::filter::{CoordSelection, CoordValuesRef};
+use crate::optimizer::cardinality::pushdown::field_range;
+use crate::reader::cf_time::apply_cf_time_conversion;
+use crate::reader::coord::CoordValues as ReadCoordValues;
 use crate::reader::filter::calculate_coord_ranges;
+use crate::reader::filter::CoordSelection;
+use crate::reader::schema_inference::ZarrArrayMeta;
+use crate::reader::zarr_reader::coord_values_to_refs;
 
 use super::plan::{derive_write_shape, find_scan, WriteShape};
 use super::skeleton::{CoordSpec, CoordValues, DataVarSpec, SkeletonSpec};
@@ -40,30 +45,37 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Read a source coordinate array in full, widened to the writer's `CoordValues`
 /// (`Int64` / `Float64`). Values are read raw — no CF-time conversion — so they
 /// round-trip back to the stored representation.
-fn load_coord(
-    store: &Arc<FilesystemStore>,
+async fn load_coord(
+    store: &AsyncReadableListableStorage,
+    prefix: &ObjectPath,
     name: &str,
     dtype: &str,
 ) -> Result<CoordValues, BoxError> {
-    let arr = Array::open(store.clone(), &format!("/{name}"))?;
+    let path = if prefix.as_ref().is_empty() {
+        format!("/{name}")
+    } else {
+        format!("/{prefix}/{name}")
+    };
+    let arr = Array::async_open(store.clone(), &path).await?;
     let full = ArraySubset::new_with_shape(arr.shape().to_vec());
-    let read = |e: zarrs::array::ArrayError| -> BoxError { Box::new(e) };
+    macro_rules! get {
+        ($t:ty) => {
+            arr.async_retrieve_array_subset::<Vec<$t>>(&full)
+                .await
+                .map_err(|e| -> BoxError { Box::new(e) })?
+        };
+    }
     Ok(match dtype {
-        "float32" => {
-            let v = arr.retrieve_array_subset::<Vec<f32>>(&full).map_err(read)?;
-            CoordValues::Float64(v.into_iter().map(|x| x as f64).collect())
-        }
-        "float64" => {
-            CoordValues::Float64(arr.retrieve_array_subset::<Vec<f64>>(&full).map_err(read)?)
-        }
-        "int8" => int64_from(arr.retrieve_array_subset::<Vec<i8>>(&full).map_err(read)?),
-        "int16" => int64_from(arr.retrieve_array_subset::<Vec<i16>>(&full).map_err(read)?),
-        "int32" => int64_from(arr.retrieve_array_subset::<Vec<i32>>(&full).map_err(read)?),
-        "uint8" => int64_from(arr.retrieve_array_subset::<Vec<u8>>(&full).map_err(read)?),
-        "uint16" => int64_from(arr.retrieve_array_subset::<Vec<u16>>(&full).map_err(read)?),
-        "uint32" => int64_from(arr.retrieve_array_subset::<Vec<u32>>(&full).map_err(read)?),
+        "float32" => CoordValues::Float64(get!(f32).into_iter().map(f64::from).collect()),
+        "float64" => CoordValues::Float64(get!(f64)),
+        "int8" => int64_from(get!(i8)),
+        "int16" => int64_from(get!(i16)),
+        "int32" => int64_from(get!(i32)),
+        "uint8" => int64_from(get!(u8)),
+        "uint16" => int64_from(get!(u16)),
+        "uint32" => int64_from(get!(u32)),
         // int64 and anything else fall back to i64.
-        _ => CoordValues::Int64(arr.retrieve_array_subset::<Vec<i64>>(&full).map_err(read)?),
+        _ => CoordValues::Int64(get!(i64)),
     })
 }
 
@@ -79,12 +91,13 @@ where
     )
 }
 
-/// A `CoordValuesRef` borrowing a writer `CoordValues`, for filter resolution.
-fn as_ref(values: &CoordValues) -> CoordValuesRef<'_> {
-    match values {
-        CoordValues::Int64(v) => CoordValuesRef::Int64(v),
-        CoordValues::Float64(v) => CoordValuesRef::Float64(v),
-    }
+/// A coordinate as the reader filters it: a CF time decoded to timestamps.
+fn as_read(values: &CoordValues, coord: &ZarrArrayMeta) -> ReadCoordValues {
+    let raw = match values {
+        CoordValues::Int64(v) => ReadCoordValues::Int64(v.clone()),
+        CoordValues::Float64(v) => ReadCoordValues::Float64(v.clone()),
+    };
+    apply_cf_time_conversion(raw, coord.cf_time_attrs.as_ref(), &coord.name)
 }
 
 /// Gather a coordinate's values by a resolved selection.
@@ -106,28 +119,29 @@ fn gather(values: &CoordValues, sel: &CoordSelection) -> CoordValues {
 /// Materialise a derived [`WriteShape`] into a [`SkeletonSpec`] by loading the
 /// source store's coordinate arrays (from `plan`'s scan) and gathering them by any
 /// coordinate filter. `chunks` is the target chunk shape, one entry per grid axis.
-pub fn materialize_spec(
+pub async fn materialize_spec(
     plan: &Arc<dyn ExecutionPlan>,
     shape: &WriteShape,
     chunks: Vec<u64>,
 ) -> Result<SkeletonSpec, BoxError> {
     let (_, zarr) = find_scan(plan).ok_or("plan has no single Zarr scan to read coordinates from")?;
     let meta = zarr.store_meta().ok_or("scan carries no store metadata")?;
-    let store = Arc::new(FilesystemStore::new(zarr.path())?);
+    let (store, prefix) = zarr.open_store().await?;
 
     // Load every source coordinate (needed to resolve filters, which reference the
     // full coordinate set), in cube-axis order.
     let coord_names: Vec<String> = meta.coords.iter().map(|c| c.name.clone()).collect();
-    let coords: Vec<CoordValues> = meta
-        .coords
-        .iter()
-        .map(|c| load_coord(&store, &c.name, &c.data_type))
-        .collect::<Result<_, _>>()?;
+    let mut coords: Vec<CoordValues> = Vec::with_capacity(meta.coords.len());
+    for c in &meta.coords {
+        coords.push(load_coord(&store, &prefix, &c.name, &c.data_type).await?);
+    }
 
     // Resolve any coordinate WHERE filters into per-axis selections.
     let selections: Option<Vec<CoordSelection>> = match zarr.coord_filters() {
         Some(filters) => {
-            let refs: Vec<CoordValuesRef> = coords.iter().map(as_ref).collect();
+            let read: Vec<ReadCoordValues> =
+                coords.iter().zip(&meta.coords).map(|(v, c)| as_read(v, c)).collect();
+            let refs = coord_values_to_refs(&read);
             match calculate_coord_ranges(filters, &coord_names, &refs) {
                 Some(sels) => Some(sels),
                 // A filter that matches no value: the write would be empty.
@@ -137,19 +151,26 @@ pub fn materialize_spec(
         None => None,
     };
 
-    // Build the target grid axes, gathered by selection where present.
+    // Build the target grid axes, gathered by selection where present. A periodic
+    // axis spans its field's whole range, whatever the selection.
     let grid_coords: Vec<CoordSpec> = shape
         .grid_axis_source
         .iter()
         .zip(&shape.grid_axes)
-        .map(|(&src, name)| {
-            let values = match &selections {
-                Some(sels) => gather(&coords[src], &sels[src]),
-                None => coords[src].clone(),
+        .zip(&shape.grid_axis_field)
+        .map(|((&src, name), field)| {
+            let values = match (field, &selections) {
+                (Some(field), _) => {
+                    let (first, last) = field_range(field)
+                        .ok_or_else(|| format!("'{field}' is not a periodic date_part"))?;
+                    CoordValues::Int64((first..=last).collect())
+                }
+                (None, Some(sels)) => gather(&coords[src], &sels[src]),
+                (None, None) => coords[src].clone(),
             };
-            CoordSpec::new(name.clone(), values)
+            Ok(CoordSpec::new(name.clone(), values))
         })
-        .collect();
+        .collect::<Result<_, BoxError>>()?;
 
     let data_vars: Vec<DataVarSpec> = shape
         .data_vars
@@ -163,10 +184,10 @@ pub fn materialize_spec(
 /// Convenience: derive the write's shape from `plan` and materialise it into a
 /// `SkeletonSpec` in one call. Rejects (as an error) any plan that is not an
 /// admissible write.
-pub fn derive_skeleton_spec(
+pub async fn derive_skeleton_spec(
     plan: &Arc<dyn ExecutionPlan>,
     chunks: Vec<u64>,
 ) -> Result<SkeletonSpec, BoxError> {
     let shape: WriteShape = derive_write_shape(plan).map_err(|r| Box::new(r) as BoxError)?;
-    materialize_spec(plan, &shape, chunks)
+    materialize_spec(plan, &shape, chunks).await
 }

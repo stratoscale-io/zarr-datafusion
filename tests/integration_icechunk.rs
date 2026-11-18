@@ -19,6 +19,7 @@ use zarr_datafusion::datasource::factory::ZarrTableFactory;
 use zarr_datafusion::optimizer::{CountStatisticsRule, MinMaxStatisticsRule};
 use zarr_datafusion::physical_plan::codec::ZarrPhysicalCodec;
 use zarr_datafusion::physical_plan::zarr_exec::ZarrExec;
+use zarr_datafusion::writer::ZarrFormatFactory;
 
 const STORE: &str = "data/synthetic.icechunk";
 
@@ -259,6 +260,39 @@ async fn shipped_scan_reopens_the_icechunk_store() {
             "{sql}"
         );
     }
+}
+
+#[tokio::test]
+async fn copies_to_zarr_with_the_repository_s_coordinates() {
+    let ctx = ctx();
+    ctx.state_ref()
+        .write()
+        .register_file_format(Arc::new(ZarrFormatFactory), true)
+        .unwrap();
+    register(&ctx).await;
+    let target = format!("{}/icechunk_copy.zarr", env!("CARGO_TARGET_TMPDIR"));
+    let _ = std::fs::remove_dir_all(&target);
+    let query = "SELECT lat, lon, avg(temperature) AS mean FROM syn \
+                 WHERE lat >= 0 GROUP BY lat, lon";
+    ctx.sql(&format!(
+        "COPY ({query}) TO '{target}' STORED AS ZARR OPTIONS ('chunks' '5,5')"
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    ctx.sql(&format!(
+        "CREATE EXTERNAL TABLE copy STORED AS ZARR LOCATION '{target}'"
+    ))
+    .await
+    .unwrap();
+    let sorted = |sql: &str| format!("SELECT * FROM ({sql}) ORDER BY lat, lon");
+    assert_eq!(
+        formatted(&ctx, &sorted("SELECT lat, lon, mean FROM copy")).await,
+        formatted(&ctx, &sorted(query)).await,
+    );
 }
 
 // ==================== remote CIRA (network-gated) ====================

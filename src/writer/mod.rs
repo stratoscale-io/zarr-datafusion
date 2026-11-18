@@ -13,6 +13,7 @@ pub mod materialize;
 pub mod plan;
 pub mod skeleton;
 pub mod sink;
+mod store;
 
 pub use copy_format::{register_zarr_write_format, ZarrFileFormat, ZarrFormatFactory};
 pub use data_sink::{zarr_write_exec, ZarrDataSink};
@@ -21,4 +22,4 @@ pub use plan::{derive_write_shape, RejectReason, WriteShape, WriteVar};
 pub use skeleton::{
     create_skeleton, CoordSpec, CoordValues, DataVarSpec, SkeletonSpec, WriteDataType,
 };
-pub use sink::{write_batches, write_batches_partitioned};
+pub use sink::{write_batches, write_batches_partitioned, write_chunks};

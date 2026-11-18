@@ -19,8 +19,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use common::{create_test_context, execute_query, register_zarr_table};
 use zarr_datafusion::writer::{
-    create_skeleton, write_batches, write_batches_partitioned, CoordSpec, CoordValues,
-    DataVarSpec, SkeletonSpec, WriteDataType,
+    create_skeleton, write_batches, write_batches_partitioned, write_chunks, CoordSpec,
+    CoordValues, DataVarSpec, SkeletonSpec, WriteDataType,
 };
 
 /// Mirrors the round-trip fixture's grid: time(7) x lat(10) x lon(12), ragged
@@ -527,4 +527,106 @@ async fn partitioned_write_leaves_fill_holes() {
         .await,
         (NT - 1) * NLAT * NLON,
     );
+}
+
+#[tokio::test]
+async fn chunk_writers_fill_one_store_between_them() {
+    // One writer a 4 x 5 tile of lat and lon, through all time: the chunks are 1 x 4
+    // x 5, so each writer's rows fall in chunks no other writer's do. A writer that
+    // wrote beyond its own chunks would erase another's cells.
+    let mono = scratch("chunks_mono.zarr");
+    create_skeleton(&mono, &rt_spec()).unwrap();
+    write_batches(&mono, &rt_spec(), [grid_batch(|_, _, _| true)]).unwrap();
+
+    let path = scratch("chunks_tiles.zarr");
+    create_skeleton(&path, &rt_spec()).unwrap();
+    let mut rows = 0;
+    for y0 in (0..NLAT).step_by(4) {
+        for x0 in (0..NLON).step_by(5) {
+            let tile = grid_batch(|_, y, x| y / 4 == y0 / 4 && x / 5 == x0 / 5);
+            rows += write_chunks(&path, &rt_spec(), [tile]).unwrap();
+        }
+    }
+    assert_eq!(rows, (NT * NLAT * NLON) as u64);
+
+    for var in ["temperature", "reflectance"] {
+        assert!(
+            nan_aware_eq(
+                &read_all_f64(&path, var).await,
+                &read_all_f64(&mono, var).await
+            ),
+            "{var} differs from one writer's",
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_chunk_writer_fills_the_rest_of_its_chunks_and_leaves_others() {
+    let path = scratch("chunks_holes.zarr");
+    create_skeleton(&path, &rt_spec()).unwrap();
+    write_chunks(&path, &rt_spec(), [grid_batch(|_, _, _| true)]).unwrap();
+    // One cell of the chunk at time 3, lat 4 to 7, lon 5 to 9.
+    let one = grid_batch(|t, y, x| (t, y, x) == (3, 6, 7));
+    write_chunks(&path, &rt_spec(), [one]).unwrap();
+
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "t", &path);
+    let at = |t, y, x| format!("SELECT temperature FROM t WHERE time={t} AND lat={y} AND lon={x}");
+    assert_eq!(scalar_i64(&ctx, &at(3, 6, 7)).await, cell(3, 6, 7));
+    let rest = scalar_i64(&ctx, &at(3, 4, 5)).await;
+    assert_eq!(rest, 0, "the rest of its chunk is fill");
+    let across = scalar_i64(&ctx, &at(3, 4, 4)).await;
+    assert_eq!(across, cell(3, 4, 4), "another chunk is kept");
+    let before = scalar_i64(&ctx, &at(2, 6, 7)).await;
+    assert_eq!(before, cell(2, 6, 7), "another chunk is kept");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn writers_write_through_an_object_store_url() {
+    let mono = scratch("url_mono.zarr");
+    create_skeleton(&mono, &rt_spec()).unwrap();
+    write_batches(&mono, &rt_spec(), [grid_batch(|_, _, _| true)]).unwrap();
+
+    let chunks = scratch("url_chunks.zarr");
+    let parts = scratch("url_parts.zarr");
+    let urls = [&chunks, &parts].map(|p| format!("file://{p}"));
+    tokio::task::spawn_blocking(move || {
+        let [chunks, parts] = &urls;
+        create_skeleton(chunks, &rt_spec()).unwrap();
+        for y0 in (0..NLAT).step_by(4) {
+            let tile = grid_batch(|_, y, _| y / 4 == y0 / 4);
+            write_chunks(chunks, &rt_spec(), [tile]).unwrap();
+        }
+        create_skeleton(parts, &rt_spec()).unwrap();
+        write_batches_partitioned(parts, &rt_spec(), [grid_batch(|_, _, _| true)], 3).unwrap();
+    })
+    .await
+    .unwrap();
+
+    for path in [&chunks, &parts] {
+        for var in ["temperature", "reflectance"] {
+            assert!(
+                nan_aware_eq(
+                    &read_all_f64(path, var).await,
+                    &read_all_f64(&mono, var).await
+                ),
+                "{var} in {path} differs from a local write's",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn sink_places_rows_on_a_descending_axis() {
+    // Latitude often runs from north to south.
+    let mut spec = rt_spec();
+    spec.coords[1] = CoordSpec::new("lat", CoordValues::Int64((0..NLAT).rev().collect()));
+    let path = scratch("descending.zarr");
+    create_skeleton(&path, &spec).unwrap();
+    write_batches(&path, &spec, [grid_batch(|_, _, _| true)]).unwrap();
+
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "t", &path);
+    let at = "SELECT temperature FROM t WHERE time=2 AND lat=3 AND lon=7";
+    assert_eq!(scalar_i64(&ctx, at).await, cell(2, 3, 7));
 }

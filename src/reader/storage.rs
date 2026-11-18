@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 use zarrs::storage::AsyncReadableListableStorage;
-use zarrs_object_store::object_store::aws::{resolve_bucket_region, AmazonS3Builder};
+use zarrs_object_store::object_store::aws::{resolve_bucket_region, AmazonS3, AmazonS3Builder};
 use zarrs_object_store::object_store::gcp::GoogleCloudStorageBuilder;
 use zarrs_object_store::object_store::http::HttpBuilder;
 use zarrs_object_store::object_store::path::Path as ObjectPath;
@@ -151,12 +151,7 @@ async fn create_s3_store(
         .host_str()
         .ok_or_else(|| StorageError::InvalidUrl("Missing bucket in S3 URL".to_string()))?;
     let path = parsed.path().trim_start_matches('/');
-
-    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
-    if let Some(region) = s3_bucket_region(bucket).await {
-        builder = builder.with_region(region);
-    }
-    let store = builder.build()?;
+    let store = s3_object_store(bucket).await?;
 
     // Returned untracked: byte counting is attached per-execution in `execute_remote`,
     // because this store is cached across queries while stats are per-query.
@@ -164,6 +159,15 @@ async fn create_s3_store(
     let object_path = ObjectPath::from(path);
 
     Ok((async_store, object_path))
+}
+
+/// `bucket`, with credentials from the environment, in the bucket's own region.
+pub(crate) async fn s3_object_store(bucket: &str) -> Result<AmazonS3, StorageError> {
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+    if let Some(region) = s3_bucket_region(bucket).await {
+        builder = builder.with_region(region);
+    }
+    Ok(builder.build()?)
 }
 
 /// The region S3 says `bucket` is in, which the environment's region may not
