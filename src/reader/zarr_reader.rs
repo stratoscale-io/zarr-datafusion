@@ -633,11 +633,7 @@ fn apply_keep(array: ArrayRef, keep: &Keep) -> Result<ArrayRef> {
             let len = array.len();
             // window_len always divides len (len = window_len * inner). Guard a
             // zero window so a degenerate plan can't panic on divide-by-zero.
-            let inner = if *window_len == 0 {
-                0
-            } else {
-                len / *window_len
-            };
+            let inner = len.checked_div(*window_len).unwrap_or(0);
             let parts: Vec<ArrayRef> = offsets
                 .iter()
                 .map(|&off| array.slice(off * inner, inner))
@@ -1633,14 +1629,13 @@ pub fn read_zarr(
     // Narrow the read to this partition's outer-dimension slice, if any. These
     // selections carry ABSOLUTE outer-axis indices (they drive the data-var
     // reads), so keep them distinct from the relative `extract_selections` below.
-    let coord_ranges =
-        apply_partition_selection(
-            coord_ranges,
-            partition_selection,
-            &partition_extra,
-            &store_meta,
-            &coord_sizes,
-        );
+    let coord_ranges = apply_partition_selection(
+        coord_ranges,
+        partition_selection,
+        &partition_extra,
+        &store_meta,
+        &coord_sizes,
+    );
 
     // Calculate effective sizes based on filters
     let (effective_coord_sizes, effective_rows) =
@@ -2314,14 +2309,13 @@ pub async fn read_zarr_async(
     // Narrow the read to this partition's outer-dimension slice, if any. These
     // selections carry ABSOLUTE outer-axis indices (they drive the data-var
     // reads), so keep them distinct from the relative `extract_selections` below.
-    let coord_ranges =
-        apply_partition_selection(
-            coord_ranges,
-            partition_selection,
-            &partition_extra,
-            &store_meta,
-            &coord_sizes,
-        );
+    let coord_ranges = apply_partition_selection(
+        coord_ranges,
+        partition_selection,
+        &partition_extra,
+        &store_meta,
+        &coord_sizes,
+    );
 
     // Calculate effective sizes based on filters
     let (effective_coord_sizes, rows_after_filter) =

@@ -47,8 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     create_skeleton(&path, &spec)?;
 
-    let (mut time, mut lat, mut lon, mut temp, mut refl) =
-        (vec![], vec![], vec![], vec![], vec![]);
+    let (mut time, mut lat, mut lon, mut temp, mut refl) = (vec![], vec![], vec![], vec![], vec![]);
     for t in 0..NT {
         for y in 0..NLAT {
             for x in 0..NLON {

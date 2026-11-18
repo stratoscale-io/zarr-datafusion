@@ -53,7 +53,10 @@ async fn recognizes_global_sum_over_data_var() {
     assert_eq!(cand.aggs.len(), 1);
     assert_eq!(cand.aggs[0].kind, AggKind::Sum);
     assert_eq!(cand.aggs[0].column.as_deref(), Some("temperature"));
-    assert!(cand.group_keys.is_empty(), "no GROUP BY => global aggregate");
+    assert!(
+        cand.group_keys.is_empty(),
+        "no GROUP BY => global aggregate"
+    );
 }
 
 #[tokio::test]
@@ -268,7 +271,11 @@ async fn bare_and_cast_wrapped_columns_still_push() {
 async fn group_by_coordinate_rewritten_to_zarr_aggregate() {
     let ctx = ctx_pushdown();
     register_zarr_table(&ctx, "t", SYNTHETIC_V3);
-    let plan = get_physical_plan(&ctx, "SELECT lat, AVG(temperature) AS a FROM t GROUP BY lat").await;
+    let plan = get_physical_plan(
+        &ctx,
+        "SELECT lat, AVG(temperature) AS a FROM t GROUP BY lat",
+    )
+    .await;
     assert!(contains_node::<ZarrAggregateExec>(&plan));
     assert!(!contains_node::<AggregateExec>(&plan));
 }
@@ -337,7 +344,10 @@ async fn periodic_group_by_enables_a_query_datafusion_cannot_run() {
                         FROM t GROUP BY time ORDER BY time";
     let by_time_base = run_on(&SessionContext::new(), MONTHLY, aggs_by_time).await;
     let by_time_push = run_on(&ctx_pushdown(), MONTHLY, aggs_by_time).await;
-    assert_eq!(by_time_base, by_time_push, "GROUP BY time must be equivalent");
+    assert_eq!(
+        by_time_base, by_time_push,
+        "GROUP BY time must be equivalent"
+    );
 
     // (3) Correctness: each month has exactly one timestamp in this fixture, so the
     //     month-grouped aggregates must equal the time-grouped ones (same order).
@@ -370,7 +380,8 @@ async fn periodic_group_single_month_matches_global() {
     // era5_v3 is entirely January, so GROUP BY month yields one group whose aggregates
     // equal the (baseline-valid) global aggregate — a cross-check on real data.
     let global = "SELECT SUM(temperature) AS s, COUNT(*) AS c FROM t";
-    let by_month = "SELECT SUM(temperature) AS s, COUNT(*) AS c FROM t GROUP BY EXTRACT(month FROM time)";
+    let by_month =
+        "SELECT SUM(temperature) AS s, COUNT(*) AS c FROM t GROUP BY EXTRACT(month FROM time)";
     let global_base = run_on(&SessionContext::new(), ERA5_V3, global).await;
     let month_push = run_on(&ctx_pushdown(), ERA5_V3, by_month).await;
     assert_eq!(global_base, month_push);
@@ -393,7 +404,11 @@ async fn over_budget_group_by_falls_back_to_datafusion() {
     // 50 the aggregate is not pushed; DataFusion handles it, still correctly.
     let ctx = ctx_with_group_budget(50);
     register_zarr_table(&ctx, "t", SYNTHETIC_V3);
-    let plan = get_physical_plan(&ctx, "SELECT lat, lon, COUNT(*) AS c FROM t GROUP BY lat, lon").await;
+    let plan = get_physical_plan(
+        &ctx,
+        "SELECT lat, lon, COUNT(*) AS c FROM t GROUP BY lat, lon",
+    )
+    .await;
     assert!(
         !contains_node::<ZarrAggregateExec>(&plan),
         "an over-budget group-by must not be pushed"
@@ -414,7 +429,11 @@ async fn within_budget_group_by_is_pushed() {
     // The same shape, but a budget of 200 admits the 100 groups -> pushed.
     let ctx = ctx_with_group_budget(200);
     register_zarr_table(&ctx, "t", SYNTHETIC_V3);
-    let plan = get_physical_plan(&ctx, "SELECT lat, lon, COUNT(*) AS c FROM t GROUP BY lat, lon").await;
+    let plan = get_physical_plan(
+        &ctx,
+        "SELECT lat, lon, COUNT(*) AS c FROM t GROUP BY lat, lon",
+    )
+    .await;
     assert!(contains_node::<ZarrAggregateExec>(&plan));
     assert!(!contains_node::<AggregateExec>(&plan));
 }

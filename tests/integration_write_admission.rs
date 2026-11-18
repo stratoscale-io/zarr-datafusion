@@ -215,7 +215,9 @@ async fn materialise_full_copy_spec() {
     )
     .await;
 
-    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).await.expect("materialise");
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5])
+        .await
+        .expect("materialise");
 
     // Grid axes carry the source coordinate values, in dimension order.
     let grid: Vec<(String, usize)> = spec
@@ -256,7 +258,9 @@ async fn materialise_subset_gathers_coordinates() {
     )
     .await;
 
-    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).await.expect("materialise");
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5])
+        .await
+        .expect("materialise");
     let axis = |n: &str| {
         spec.coords
             .iter()
@@ -284,7 +288,9 @@ async fn copy_roundtrips(src: &str, tag: &str) {
     )
     .await;
 
-    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).await.expect("materialise");
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5])
+        .await
+        .expect("materialise");
     let target = scratch(tag);
     create_skeleton(&target, &spec).expect("create target");
 
@@ -341,7 +347,9 @@ async fn data_sink_writes_a_store_as_an_execution_plan() {
 
     // Derive the spec at plan time (not from the stream), then wrap the input in a
     // sink node. Executing the node creates the skeleton and writes the store.
-    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5]).await.expect("materialise");
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5])
+        .await
+        .expect("materialise");
     let target = scratch("datasink_copy.zarr");
     let exec = zarr_write_exec(plan, target.clone(), spec, 3); // 3 write partitions
 

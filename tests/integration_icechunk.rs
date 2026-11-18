@@ -216,7 +216,6 @@ async fn formatted(ctx: &SessionContext, sql: &str) -> String {
         .to_string()
 }
 
-
 /// `plan` with each scan sent through the codec, as a worker receives it:
 /// without the store the head opened.
 fn shipped(ctx: &SessionContext, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {

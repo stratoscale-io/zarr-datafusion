@@ -31,8 +31,8 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 
-use super::skeleton::{create_skeleton, SkeletonSpec};
 use super::sink::{write_batches, write_batches_partitioned, write_chunks};
+use super::skeleton::{create_skeleton, SkeletonSpec};
 
 /// A DataFusion sink that writes its input stream into a Zarr store.
 ///
@@ -161,6 +161,11 @@ pub fn zarr_write_exec(
         input
     };
     let schema = input.schema();
-    let sink = Arc::new(ZarrDataSink::new(store_path, spec, schema, target_partitions));
+    let sink = Arc::new(ZarrDataSink::new(
+        store_path,
+        spec,
+        schema,
+        target_partitions,
+    ));
     Arc::new(DataSinkExec::new(input, sink, None))
 }

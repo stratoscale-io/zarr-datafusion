@@ -42,7 +42,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Chunks: explicit third arg, else keep the source's data-variable chunking.
     let chunks: Vec<u64> = match args.get(3) {
-        Some(s) => s.split(',').map(|p| p.trim().parse()).collect::<Result<_, _>>()?,
+        Some(s) => s
+            .split(',')
+            .map(|p| p.trim().parse())
+            .collect::<Result<_, _>>()?,
         None => meta
             .data_vars
             .first()

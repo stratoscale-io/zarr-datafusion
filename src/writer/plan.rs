@@ -195,9 +195,7 @@ fn aggregate_columns(plan: &Arc<dyn ExecutionPlan>) -> Vec<Option<usize>> {
 
 /// Derive the write's structural shape from the physical plan feeding the sink, or
 /// reject it. See the module docs for the admission rule.
-pub fn derive_write_shape(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Result<WriteShape, RejectReason> {
+pub fn derive_write_shape(plan: &Arc<dyn ExecutionPlan>) -> Result<WriteShape, RejectReason> {
     let (maybe_agg, zarr) = find_scan(plan).ok_or(RejectReason::NotSingleZarrScan)?;
     let meta = zarr.store_meta().ok_or(RejectReason::NoStoreMeta)?;
 

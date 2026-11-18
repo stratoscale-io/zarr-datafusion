@@ -98,11 +98,27 @@ async fn skeleton_data_vars_read_as_fill_value() {
     .await;
 
     let batch = &batches[0];
-    let n = batch.column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
-    let non_nan = batch.column(1).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
-    let abs_sum = batch.column(2).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+    let n = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    let non_nan = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    let abs_sum = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
 
-    assert_eq!(n.value(0), 7 * 10 * 12, "full cartesian product of the grid");
+    assert_eq!(
+        n.value(0),
+        7 * 10 * 12,
+        "full cartesian product of the grid"
+    );
     assert_eq!(non_nan.value(0), 0, "float var must be entirely NaN fill");
     assert_eq!(abs_sum.value(0), 0, "int var must be entirely 0 fill");
 }
@@ -145,9 +161,13 @@ fn skeleton_rejects_specs_that_would_be_unreadable() {
     // A data variable named like a coordinate would be read back as a 1-D
     // coordinate, silently losing the variable.
     let mut spec = rt_spec();
-    spec.data_vars.push(DataVarSpec::new("lat", WriteDataType::Float32));
+    spec.data_vars
+        .push(DataVarSpec::new("lat", WriteDataType::Float32));
     let err = create_skeleton(&scratch("bad_collide.zarr"), &spec).unwrap_err();
-    assert!(err.to_string().contains("collides with a coordinate"), "{err}");
+    assert!(
+        err.to_string().contains("collides with a coordinate"),
+        "{err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +265,10 @@ async fn sink_full_write_roundtrips_every_cell() {
             }
         }
     }
-    assert_eq!(scalar_i64(&ctx, "SELECT SUM(temperature) FROM t").await, expected);
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT SUM(temperature) FROM t").await,
+        expected
+    );
 
     // The corner of the doubly-ragged last chunk (lat 10/4, lon 12/5): the place
     // an edge-chunk sizing bug would surface.
@@ -301,7 +324,10 @@ async fn sink_is_order_independent() {
             }
         }
     }
-    assert_eq!(scalar_i64(&ctx, "SELECT SUM(temperature) FROM t").await, expected);
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT SUM(temperature) FROM t").await,
+        expected
+    );
 }
 
 #[tokio::test]
@@ -338,11 +364,19 @@ async fn sink_filtered_write_leaves_fill_holes() {
     );
     // A written cell holds its value; an unwritten one is the int fill 0.
     assert_eq!(
-        scalar_i64(&ctx, "SELECT temperature FROM t WHERE time=3 AND lat=4 AND lon=6").await,
+        scalar_i64(
+            &ctx,
+            "SELECT temperature FROM t WHERE time=3 AND lat=4 AND lon=6"
+        )
+        .await,
         cell(3, 4, 6),
     );
     assert_eq!(
-        scalar_i64(&ctx, "SELECT temperature FROM t WHERE time=0 AND lat=4 AND lon=6").await,
+        scalar_i64(
+            &ctx,
+            "SELECT temperature FROM t WHERE time=0 AND lat=4 AND lon=6"
+        )
+        .await,
         0,
     );
 }
@@ -357,13 +391,18 @@ async fn sink_roundtrips_nan_in_float() {
     register_zarr_table(&ctx, "t", &path);
 
     // The deliberately-NaN cell reads back NaN; a neighbour holds its real value.
-    assert!(
-        scalar_f32(&ctx, "SELECT reflectance FROM t WHERE time=1 AND lat=2 AND lon=3")
-            .await
-            .is_nan(),
-    );
+    assert!(scalar_f32(
+        &ctx,
+        "SELECT reflectance FROM t WHERE time=1 AND lat=2 AND lon=3"
+    )
+    .await
+    .is_nan(),);
     assert_eq!(
-        scalar_f32(&ctx, "SELECT reflectance FROM t WHERE time=1 AND lat=2 AND lon=4").await,
+        scalar_f32(
+            &ctx,
+            "SELECT reflectance FROM t WHERE time=1 AND lat=2 AND lon=4"
+        )
+        .await,
         cell(1, 2, 4) as f32,
     );
 }
@@ -394,7 +433,9 @@ fn sink_rejects_value_off_the_grid() {
     )
     .unwrap();
 
-    let err = write_batches(&path, &rt_spec(), [bad]).unwrap_err().to_string();
+    let err = write_batches(&path, &rt_spec(), [bad])
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("999") && err.contains("axis"), "{err}");
 }
 
@@ -465,7 +506,11 @@ async fn partitioned_write_matches_monolithic_across_partition_counts() {
         let path = scratch(&format!("part_{parts}.zarr"));
         create_skeleton(&path, &rt_spec()).unwrap();
         let n = write_batches_partitioned(&path, &rt_spec(), [batch.clone()], parts).unwrap();
-        assert_eq!(n, (NT * NLAT * NLON) as u64, "row count with {parts} partitions");
+        assert_eq!(
+            n,
+            (NT * NLAT * NLON) as u64,
+            "row count with {parts} partitions"
+        );
 
         assert!(
             nan_aware_eq(&read_all_f64(&path, "temperature").await, &mono_temp),
@@ -490,11 +535,19 @@ async fn partitioned_write_is_faithful_to_the_formula() {
     let ctx = create_test_context();
     register_zarr_table(&ctx, "t", &path);
     assert_eq!(
-        scalar_i64(&ctx, "SELECT temperature FROM t WHERE time=6 AND lat=9 AND lon=11").await,
+        scalar_i64(
+            &ctx,
+            "SELECT temperature FROM t WHERE time=6 AND lat=9 AND lon=11"
+        )
+        .await,
         cell(6, 9, 11),
     );
     assert_eq!(
-        scalar_i64(&ctx, "SELECT temperature FROM t WHERE time=2 AND lat=3 AND lon=7").await,
+        scalar_i64(
+            &ctx,
+            "SELECT temperature FROM t WHERE time=2 AND lat=3 AND lon=7"
+        )
+        .await,
         cell(2, 3, 7),
     );
 }
@@ -511,11 +564,19 @@ async fn partitioned_write_leaves_fill_holes() {
     let ctx = create_test_context();
     register_zarr_table(&ctx, "t", &path);
     assert_eq!(
-        scalar_i64(&ctx, "SELECT temperature FROM t WHERE time=3 AND lat=4 AND lon=6").await,
+        scalar_i64(
+            &ctx,
+            "SELECT temperature FROM t WHERE time=3 AND lat=4 AND lon=6"
+        )
+        .await,
         cell(3, 4, 6),
     );
     assert_eq!(
-        scalar_i64(&ctx, "SELECT temperature FROM t WHERE time=0 AND lat=4 AND lon=6").await,
+        scalar_i64(
+            &ctx,
+            "SELECT temperature FROM t WHERE time=0 AND lat=4 AND lon=6"
+        )
+        .await,
         0,
         "untouched outer chunk must read as fill",
     );

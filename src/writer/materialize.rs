@@ -86,7 +86,11 @@ where
 {
     CoordValues::Int64(
         raw.into_iter()
-            .map(|x| i64::try_from(x).ok().expect("integer coordinate fits in i64"))
+            .map(|x| {
+                i64::try_from(x)
+                    .ok()
+                    .expect("integer coordinate fits in i64")
+            })
             .collect(),
     )
 }
@@ -103,7 +107,9 @@ fn as_read(values: &CoordValues, coord: &ZarrArrayMeta) -> ReadCoordValues {
 /// Gather a coordinate's values by a resolved selection.
 fn gather(values: &CoordValues, sel: &CoordSelection) -> CoordValues {
     match (values, sel) {
-        (CoordValues::Int64(v), CoordSelection::Range(s, e)) => CoordValues::Int64(v[*s..*e].to_vec()),
+        (CoordValues::Int64(v), CoordSelection::Range(s, e)) => {
+            CoordValues::Int64(v[*s..*e].to_vec())
+        }
         (CoordValues::Int64(v), CoordSelection::Indices(idx)) => {
             CoordValues::Int64(idx.iter().map(|&i| v[i]).collect())
         }
@@ -124,7 +130,8 @@ pub async fn materialize_spec(
     shape: &WriteShape,
     chunks: Vec<u64>,
 ) -> Result<SkeletonSpec, BoxError> {
-    let (_, zarr) = find_scan(plan).ok_or("plan has no single Zarr scan to read coordinates from")?;
+    let (_, zarr) =
+        find_scan(plan).ok_or("plan has no single Zarr scan to read coordinates from")?;
     let meta = zarr.store_meta().ok_or("scan carries no store metadata")?;
     let (store, prefix) = zarr.open_store().await?;
 
@@ -139,8 +146,11 @@ pub async fn materialize_spec(
     // Resolve any coordinate WHERE filters into per-axis selections.
     let selections: Option<Vec<CoordSelection>> = match zarr.coord_filters() {
         Some(filters) => {
-            let read: Vec<ReadCoordValues> =
-                coords.iter().zip(&meta.coords).map(|(v, c)| as_read(v, c)).collect();
+            let read: Vec<ReadCoordValues> = coords
+                .iter()
+                .zip(&meta.coords)
+                .map(|(v, c)| as_read(v, c))
+                .collect();
             let refs = coord_values_to_refs(&read);
             match calculate_coord_ranges(filters, &coord_names, &refs) {
                 Some(sels) => Some(sels),

@@ -22,13 +22,13 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tracing::{debug, info};
 use zarrs::array::codec::bytes_to_bytes::blosc::{
     BloscCompressionLevel, BloscCompressor, BloscShuffleMode,
 };
 use zarrs::array::codec::BloscCodec;
 use zarrs::array::{ArrayBuilder, DataType, FillValue};
 use zarrs::group::GroupBuilder;
-use tracing::{debug, info};
 
 use super::store::open_target;
 
@@ -379,7 +379,15 @@ mod tests {
 
     #[test]
     fn from_arrow_widens_integers_to_int64() {
-        for dt in [A::Int8, A::Int16, A::Int32, A::Int64, A::UInt8, A::UInt16, A::UInt32] {
+        for dt in [
+            A::Int8,
+            A::Int16,
+            A::Int32,
+            A::Int64,
+            A::UInt8,
+            A::UInt16,
+            A::UInt32,
+        ] {
             assert_eq!(
                 WriteDataType::from_arrow(&dt).unwrap(),
                 WriteDataType::Int64,
@@ -407,7 +415,9 @@ mod tests {
 
     #[test]
     fn from_arrow_refuses_uint64_rather_than_truncating() {
-        let err = WriteDataType::from_arrow(&A::UInt64).unwrap_err().to_string();
+        let err = WriteDataType::from_arrow(&A::UInt64)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("UInt64"), "{err}");
         assert!(err.contains("lossless"), "{err}");
     }
@@ -431,6 +441,9 @@ mod tests {
         let spec = DataVarSpec::from_arrow_field(&field).unwrap();
         assert_eq!(spec.name, "ndvi");
         assert_eq!(spec.data_type, WriteDataType::Float32);
-        assert!(spec.fill_value.is_none(), "default NaN fill for a float var");
+        assert!(
+            spec.fill_value.is_none(),
+            "default NaN fill for a float var"
+        );
     }
 }
