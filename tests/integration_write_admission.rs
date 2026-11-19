@@ -761,3 +761,97 @@ async fn rejects_two_zarr_scans_joined_and_an_outer_join() {
         );
     }
 }
+
+// --- a join with another Zarr store ----------------------------------------
+
+/// `src` with `m`, its mean temperature at each cell, written to a Zarr store
+/// of the test's own.
+async fn ctx_with_means(test: &str) -> SessionContext {
+    let ctx = create_baseline_context();
+    register_zarr_write_format(&ctx).expect("register format");
+    register_zarr_table(&ctx, "src", SRC);
+    let means = scratch(&format!("{test}_means.zarr"));
+    ctx.sql(&format!(
+        "COPY (SELECT lat, lon, avg(temperature) AS mean FROM src GROUP BY lat, lon) \
+         TO '{means}' STORED AS ZARR OPTIONS ('chunks' '5,4')"
+    ))
+    .await
+    .expect("plan means")
+    .collect()
+    .await
+    .expect("write means");
+    register_zarr_table(&ctx, "m", &means);
+    ctx
+}
+
+const ANOMALY: &str = "SELECT s.time, s.lat, s.lon, s.temperature - m.mean AS anomaly \
+     FROM m JOIN src s ON s.lat = m.lat AND s.lon = m.lon";
+
+#[tokio::test]
+async fn admits_a_projection_over_a_join_on_every_coordinate_of_another_store() {
+    let ctx = ctx_with_means("admits").await;
+
+    let shape = shape_of(&ctx, ANOMALY).await.expect("admitted");
+
+    assert_eq!(shape.grid_axes, vec!["time", "lat", "lon"]);
+    assert_eq!(shape.grid_axis_source, vec![Some(0), Some(1), Some(2)]);
+    assert!(!shape.is_reduce);
+    assert_eq!(shape.data_vars.len(), 1);
+}
+
+#[tokio::test]
+async fn rejects_a_projection_over_a_join_on_some_coordinates_of_another_store() {
+    let ctx = ctx_with_means("rejects").await;
+
+    // each source row meets every longitude's mean
+    let shape = shape_of(&ctx, &ANOMALY.replace(" AND s.lon = m.lon", "")).await;
+
+    assert_eq!(shape, Err(RejectReason::JoinWithoutGroupBy));
+}
+
+#[tokio::test]
+async fn a_join_on_a_coordinate_cast_without_loss_equates_it() {
+    let ctx = ctx_with_means("casts").await;
+    let cast = |to: &str| {
+        ANOMALY.replace(
+            "s.lon = m.lon",
+            &format!("CAST(s.lon AS {to}) = CAST(m.lon AS {to})"),
+        )
+    };
+
+    assert!(shape_of(&ctx, &cast("DOUBLE")).await.is_ok());
+    assert_eq!(
+        shape_of(&ctx, &cast("INT")).await,
+        Err(RejectReason::JoinWithoutGroupBy)
+    );
+}
+
+#[tokio::test]
+async fn copy_to_writes_a_projection_over_a_join_with_another_store() {
+    let ctx = ctx_with_means("copy_to").await;
+    let target = scratch("copyto_anomaly.zarr");
+
+    ctx.sql(&format!(
+        "COPY ({ANOMALY}) TO '{target}' STORED AS ZARR OPTIONS ('chunks' '1,5,4')"
+    ))
+    .await
+    .expect("plan COPY")
+    .collect()
+    .await
+    .expect("run COPY");
+
+    let tgt = create_baseline_context();
+    register_zarr_table(&tgt, "t", &target);
+    assert_eq!(
+        scalar_i64(&tgt, "SELECT count(*) FROM t").await,
+        7 * 10 * 12
+    );
+    // each value weighted by its cell, so a value in the wrong cell shows
+    let placed = "SELECT sum(anomaly * (1 + time + lat * 10 + lon * 100))";
+    let expected = scalar_f64(&ctx, &format!("{placed} FROM ({ANOMALY})")).await;
+    let written = scalar_f64(&tgt, &format!("{placed} FROM t")).await;
+    assert!(
+        (expected - written).abs() <= 1e-9 * expected.abs(),
+        "{expected} != {written}"
+    );
+}
