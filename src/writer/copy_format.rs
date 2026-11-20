@@ -187,8 +187,8 @@ impl FileFormat for ZarrFileFormat {
 
 /// The source store's data-variable chunk shape, if the plan reads one Zarr store.
 fn source_chunks(input: &Arc<dyn ExecutionPlan>) -> Option<Vec<u64>> {
-    let (_, zarr) = find_scan(input)?;
-    zarr.store_meta()?.data_vars.first()?.chunks.clone()
+    let source = find_scan(input)?;
+    source.zarr.store_meta()?.data_vars.first()?.chunks.clone()
 }
 
 /// Register `STORED AS ZARR` for `COPY TO` on a context. Idempotent-ish: overwrites

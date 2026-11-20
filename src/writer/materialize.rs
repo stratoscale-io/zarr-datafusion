@@ -130,8 +130,8 @@ pub async fn materialize_spec(
     shape: &WriteShape,
     chunks: Vec<u64>,
 ) -> Result<SkeletonSpec, BoxError> {
-    let (_, zarr) =
-        find_scan(plan).ok_or("plan has no single Zarr scan to read coordinates from")?;
+    let source = find_scan(plan).ok_or("plan has no single Zarr scan to read coordinates from")?;
+    let zarr = source.zarr;
     let meta = zarr.store_meta().ok_or("scan carries no store metadata")?;
     let (store, prefix) = zarr.open_store().await?;
 

@@ -34,6 +34,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::Schema;
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -140,27 +141,30 @@ impl fmt::Display for RejectReason {
 
 impl std::error::Error for RejectReason {}
 
+/// What a write reads: its one Zarr scan, and the aggregate above it if any.
+pub(crate) struct Source<'a> {
+    pub agg: Option<&'a AggregateExec>,
+    pub zarr: &'a ZarrExec,
+}
+
 /// Walk down single-child plan nodes to the `ZarrExec`, capturing an
 /// `AggregateExec` on the way. Returns `None` (not admissible) at any node with a
 /// number of children other than one — which is what rejects joins and other
 /// multi-input plans. Mirrors `cardinality::rule::descend_to_zarr`, but the
 /// aggregate is optional so a pure projection is reachable too.
-pub(crate) fn find_scan(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Option<(Option<&AggregateExec>, &ZarrExec)> {
+pub(crate) fn find_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Source<'_>> {
     fn go<'a>(
         node: &'a Arc<dyn ExecutionPlan>,
         agg: Option<&'a AggregateExec>,
-    ) -> Option<(Option<&'a AggregateExec>, &'a ZarrExec)> {
+    ) -> Option<Source<'a>> {
         if let Some(zarr) = node.downcast_ref::<ZarrExec>() {
-            return Some((agg, zarr));
+            return Some(Source { agg, zarr });
         }
         let agg = node.downcast_ref::<AggregateExec>().or(agg);
-        let children = node.children();
-        if children.len() != 1 {
-            return None;
+        match node.children()[..] {
+            [child] => go(child, agg),
+            _ => None,
         }
-        go(children[0], agg)
     }
     go(plan, None)
 }
@@ -196,7 +200,8 @@ fn aggregate_columns(plan: &Arc<dyn ExecutionPlan>) -> Vec<Option<usize>> {
 /// Derive the write's structural shape from the physical plan feeding the sink, or
 /// reject it. See the module docs for the admission rule.
 pub fn derive_write_shape(plan: &Arc<dyn ExecutionPlan>) -> Result<WriteShape, RejectReason> {
-    let (maybe_agg, zarr) = find_scan(plan).ok_or(RejectReason::NotSingleZarrScan)?;
+    let source = find_scan(plan).ok_or(RejectReason::NotSingleZarrScan)?;
+    let (maybe_agg, zarr) = (source.agg, source.zarr);
     let meta = zarr.store_meta().ok_or(RejectReason::NoStoreMeta)?;
 
     // Source axes, in dimension order, with a name -> index lookup.
@@ -236,33 +241,13 @@ pub fn derive_write_shape(plan: &Arc<dyn ExecutionPlan>) -> Result<WriteShape, R
     }
     let is_key = |name: &str| keys.iter().any(|(_, key, _)| key == name);
 
-    // Every output column that is not a coordinate (a source one, or a group key)
-    // is a data variable to write. Its element type is the widened Arrow type
-    // (gap 5). Coordinate columns are grid axes, handled below.
-    let mut data_vars = Vec::new();
-    for field in out.fields() {
-        let coordinate = if maybe_agg.is_some() {
-            is_key(field.name())
+    let data_vars = data_vars(&out, |name| {
+        if maybe_agg.is_some() {
+            is_key(name)
         } else {
-            axis_index(field.name()).is_some()
-        };
-        if coordinate {
-            continue;
+            axis_index(name).is_some()
         }
-        let data_type = WriteDataType::from_arrow(field.data_type()).map_err(|e| {
-            RejectReason::UnwritableColumn {
-                name: field.name().clone(),
-                why: e.to_string(),
-            }
-        })?;
-        data_vars.push(WriteVar {
-            name: field.name().clone(),
-            data_type,
-        });
-    }
-    if data_vars.is_empty() {
-        return Err(RejectReason::NoDataVariables);
-    }
+    })?;
 
     if maybe_agg.is_some() {
         let (grid_axis_source, grid_axes, grid_axis_field) = keys.into_iter().fold(
@@ -304,4 +289,32 @@ pub fn derive_write_shape(plan: &Arc<dyn ExecutionPlan>) -> Result<WriteShape, R
         data_vars,
         is_reduce: false,
     })
+}
+
+/// Every output column that isn't a coordinate is a data variable to write. Its
+/// element type is the widened Arrow type (gap 5).
+fn data_vars(
+    out: &Schema,
+    coordinate: impl Fn(&str) -> bool,
+) -> Result<Vec<WriteVar>, RejectReason> {
+    let mut vars = Vec::new();
+    for field in out.fields() {
+        if coordinate(field.name()) {
+            continue;
+        }
+        let data_type = WriteDataType::from_arrow(field.data_type()).map_err(|e| {
+            RejectReason::UnwritableColumn {
+                name: field.name().clone(),
+                why: e.to_string(),
+            }
+        })?;
+        vars.push(WriteVar {
+            name: field.name().clone(),
+            data_type,
+        });
+    }
+    if vars.is_empty() {
+        return Err(RejectReason::NoDataVariables);
+    }
+    Ok(vars)
 }
