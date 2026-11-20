@@ -38,16 +38,19 @@ use std::collections::BTreeMap;
 
 use arrow::array::{Array as _, Float32Array, Float64Array, Int64Array};
 use arrow::compute::cast;
-use arrow::datatypes::DataType as ArrowType;
+use arrow::datatypes::{DataType as ArrowType, Float64Type, Int64Type, TimeUnit};
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use serde_json::Value;
 use tracing::{debug, info};
 use zarrs::array::Array;
 use zarrs::array::ArraySubset;
 use zarrs::storage::{ReadableWritableListableStorage, ReadableWritableListableStorageTraits};
 
-use super::skeleton::{CoordValues, SkeletonSpec, WriteDataType};
+use super::skeleton::{CoordSpec, CoordValues, SkeletonSpec, WriteDataType};
 use super::store::open_target;
 use crate::physical_plan::partition::plan_partitions;
+use crate::reader::cf_time::{CFTimeAttrs, CFTimeUnit};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -191,31 +194,99 @@ fn reject_custom_fills(spec: &SkeletonSpec) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// The axis's CF time units, if it is a CF time.
+fn cf_time_unit(coord: &CoordSpec) -> Option<CFTimeUnit> {
+    let units = coord.attributes.get("units")?.as_str()?;
+    let calendar = coord.attributes.get("calendar").and_then(Value::as_str);
+    let attrs = CFTimeAttrs::new(units.to_string(), calendar.map(String::from));
+    attrs
+        .is_time_coordinate()
+        .then(|| attrs.parse().ok())
+        .flatten()
+}
+
+/// Microseconds since the epoch, if `name`'s column holds timestamps.
+fn timestamps_us(batch: &RecordBatch, name: &str) -> Result<Option<Int64Array>, BoxError> {
+    let idx = batch
+        .schema()
+        .index_of(name)
+        .map_err(|_| format!("column '{name}' not found in input"))?;
+    let mut col = batch.column(idx).clone();
+    if let ArrowType::Dictionary(_, value) = col.data_type() {
+        col = cast(&col, value)?;
+    }
+    let ArrowType::Timestamp(unit, _) = col.data_type() else {
+        return Ok(None);
+    };
+    let unit = *unit;
+    let raw = cast(&col, &ArrowType::Int64)?;
+    let raw = raw
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or("cast to Int64 did not yield Int64Array")?;
+    Ok(Some(raw.unary::<_, Int64Type>(|v| match unit {
+        TimeUnit::Second => v * 1_000_000,
+        TimeUnit::Millisecond => v * 1_000,
+        TimeUnit::Microsecond => v,
+        TimeUnit::Nanosecond => v / 1_000,
+    })))
+}
+
+/// Timestamps in a CF time's stored units, refusing any that fall between them,
+/// which would otherwise be placed in the wrong cell.
+fn cf_encode(us: &Int64Array, unit: &CFTimeUnit, name: &str) -> Result<Int64Array, BoxError> {
+    Ok(us.try_unary::<_, Int64Type, _>(|v| {
+        let since = v - unit.epoch_offset_us;
+        if unit.is_nanoseconds {
+            Ok(since * 1_000)
+        } else if since % unit.multiplier_us == 0 {
+            Ok(since / unit.multiplier_us)
+        } else {
+            Err(ArrowError::ComputeError(format!(
+                "value {v} in column '{name}' is not on axis '{name}': \
+                 not a whole number of its units"
+            )))
+        }
+    })?)
+}
+
 /// A batch's coordinate columns, one per grid axis, cast to their axes' types.
+/// The rows carry a CF time decoded, and the axis keeps it as stored, so the
+/// rows' timestamps are encoded to match.
 fn axis_columns<'a>(
     batch: &RecordBatch,
     spec: &'a SkeletonSpec,
 ) -> Result<Vec<AxisCol<'a>>, BoxError> {
     spec.coords
         .iter()
-        .map(|c| match &c.values {
-            CoordValues::Int64(axis) => {
-                let arr = cast_to(batch, &c.name, &ArrowType::Int64)?;
-                let col = arr
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or("cast to Int64 did not yield Int64Array")?
-                    .clone();
-                Ok(AxisCol::I64 { col, axis })
-            }
-            CoordValues::Float64(axis) => {
-                let arr = cast_to(batch, &c.name, &ArrowType::Float64)?;
-                let col = arr
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or("cast to Float64 did not yield Float64Array")?
-                    .clone();
-                Ok(AxisCol::F64 { col, axis })
+        .map(|c| {
+            let encoded = match (cf_time_unit(c), timestamps_us(batch, &c.name)?) {
+                (Some(unit), Some(us)) => Some(cf_encode(&us, &unit, &c.name)?),
+                _ => None,
+            };
+            match &c.values {
+                CoordValues::Int64(axis) => {
+                    let col = match encoded {
+                        Some(raw) => raw,
+                        None => cast_to(batch, &c.name, &ArrowType::Int64)?
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .ok_or("cast to Int64 did not yield Int64Array")?
+                            .clone(),
+                    };
+                    Ok(AxisCol::I64 { col, axis })
+                }
+                CoordValues::Float64(axis) => {
+                    let col = match encoded {
+                        Some(raw) => raw.unary::<_, Float64Type>(|v| v as f64),
+                        None => cast_to(batch, &c.name, &ArrowType::Float64)?
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .ok_or("cast to Float64 did not yield Float64Array")?
+                            .clone(),
+                    };
+                    Ok(AxisCol::F64 { col, axis })
+                }
             }
         })
         .collect()
