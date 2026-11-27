@@ -215,7 +215,7 @@ async fn materialise_full_copy_spec() {
     )
     .await;
 
-    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5])
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5], ctx.task_ctx())
         .await
         .expect("materialise");
 
@@ -258,7 +258,7 @@ async fn materialise_subset_gathers_coordinates() {
     )
     .await;
 
-    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5])
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5], ctx.task_ctx())
         .await
         .expect("materialise");
     let axis = |n: &str| {
@@ -288,7 +288,7 @@ async fn copy_roundtrips(src: &str, tag: &str) {
     )
     .await;
 
-    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5])
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5], ctx.task_ctx())
         .await
         .expect("materialise");
     let target = scratch(tag);
@@ -347,7 +347,7 @@ async fn data_sink_writes_a_store_as_an_execution_plan() {
 
     // Derive the spec at plan time (not from the stream), then wrap the input in a
     // sink node. Executing the node creates the skeleton and writes the store.
-    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5])
+    let spec = derive_skeleton_spec(&plan, vec![1, 4, 5], ctx.task_ctx())
         .await
         .expect("materialise");
     let target = scratch("datasink_copy.zarr");
@@ -584,4 +584,274 @@ async fn copy_to_filters_on_a_cf_time_as_the_reader_does() {
     register_zarr_table(&tgt, "c", &target);
     let written = pairs(&tgt, "SELECT month, mean FROM c").await;
     assert_eq!(written, vec![(3, 20.0), (4, 30.0)]);
+}
+
+#[tokio::test]
+async fn copy_to_writes_a_cf_time_axis_that_reads_back_as_the_same_times() {
+    // time is stored as days since 2020-01-15; the rows carry decoded timestamps
+    let ctx = ctx_over_monthly();
+    register_zarr_write_format(&ctx).expect("register format");
+    let query = "SELECT time, lat, lon, AVG(temperature) AS mean FROM t GROUP BY time, lat, lon";
+    let target = scratch("copyto_cf_time.zarr");
+    ctx.sql(&format!("COPY ({query}) TO '{target}' STORED AS ZARR"))
+        .await
+        .expect("plan COPY")
+        .collect()
+        .await
+        .expect("run COPY");
+
+    let attrs = |store: &str| {
+        let meta = std::fs::read_to_string(format!("{store}/time/zarr.json")).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        meta["attributes"].clone()
+    };
+    assert_eq!(attrs(&target)["units"], attrs(MONTHLY)["units"]);
+    let tgt = create_baseline_context();
+    register_zarr_table(&tgt, "c", &target);
+    assert_eq!(
+        pairs(&tgt, "SELECT time, AVG(mean) FROM c GROUP BY time").await,
+        pairs(&ctx, "SELECT time, AVG(temperature) FROM t GROUP BY time").await,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A write over a join with a table that reads no Zarr
+// ---------------------------------------------------------------------------
+
+/// `src` with `w`, weights averaging each 2 x 3 block of its 10 x 12 cells onto
+/// a coarse 5 x 4 grid, as regridding does.
+async fn ctx_with_weights() -> SessionContext {
+    let ctx = create_baseline_context();
+    register_zarr_write_format(&ctx).expect("register format");
+    register_zarr_table(&ctx, "src", SRC);
+    ctx.sql(
+        "CREATE TABLE w AS SELECT a.value AS src_lat, b.value AS src_lon, \
+         CAST(a.value / 2 AS DOUBLE) AS dst_lat, CAST(b.value / 3 AS DOUBLE) AS dst_lon, \
+         1.0 / 6 AS weight \
+         FROM generate_series(0, 9) a CROSS JOIN generate_series(0, 11) b",
+    )
+    .await
+    .expect("weights")
+    .collect()
+    .await
+    .expect("weights");
+    ctx
+}
+
+const REGRID: &str = "SELECT s.time, w.dst_lat, w.dst_lon, sum(s.temperature * w.weight) AS t \
+     FROM w JOIN src s ON s.lat = w.src_lat AND s.lon = w.src_lon \
+     GROUP BY s.time, w.dst_lat, w.dst_lon";
+
+async fn scalar_f64(ctx: &SessionContext, sql: &str) -> f64 {
+    let b = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    b[0].column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap()
+        .value(0)
+}
+
+#[tokio::test]
+async fn admits_a_reduce_over_a_join_with_the_tables_columns_as_axes() {
+    let ctx = ctx_with_weights().await;
+
+    let shape = shape_of(&ctx, REGRID).await.expect("admitted");
+
+    assert_eq!(shape.grid_axes, vec!["time", "dst_lat", "dst_lon"]);
+    assert_eq!(shape.grid_axis_source, vec![Some(0), None, None]);
+    assert_eq!(
+        shape.grid_axis_table,
+        vec![
+            None,
+            Some("dst_lat".to_string()),
+            Some("dst_lon".to_string())
+        ]
+    );
+    assert_eq!(shape.data_vars.len(), 1);
+}
+
+#[tokio::test]
+async fn copy_to_writes_a_reduce_over_a_join_with_a_table() {
+    let ctx = ctx_with_weights().await;
+    // a file scan too, which keeps state across its partitions for an execution
+    let parquet = scratch("weights.parquet");
+    for sql in [
+        format!("COPY (SELECT * FROM w) TO '{parquet}' STORED AS PARQUET"),
+        format!("CREATE EXTERNAL TABLE wp STORED AS PARQUET LOCATION '{parquet}'"),
+    ] {
+        ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+    }
+
+    for table in ["w", "wp"] {
+        let query = REGRID.replace("FROM w JOIN", &format!("FROM {table} w JOIN"));
+        let target = scratch(&format!("copyto_joined_{table}.zarr"));
+        ctx.sql(&format!(
+            "COPY ({query}) TO '{target}' STORED AS ZARR OPTIONS ('chunks' '1,5,4')"
+        ))
+        .await
+        .expect("plan COPY")
+        .collect()
+        .await
+        .expect("run COPY");
+
+        let tgt = create_baseline_context();
+        register_zarr_table(&tgt, "t", &target);
+        assert_eq!(scalar_i64(&tgt, "SELECT count(*) FROM t").await, 7 * 5 * 4);
+        // each value weighted by its cell, so a value in the wrong cell shows
+        let placed = "SELECT sum(t * (1 + dst_lat * 10 + dst_lon))";
+        let expected = scalar_f64(&ctx, &format!("{placed} FROM ({query})")).await;
+        let written = scalar_f64(&tgt, &format!("{placed} FROM t")).await;
+        assert!(
+            (expected - written).abs() <= 1e-9 * expected.abs(),
+            "{table}: {expected} != {written}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rejects_a_join_without_a_group_by() {
+    let ctx = ctx_with_weights().await;
+
+    let shape = shape_of(
+        &ctx,
+        "SELECT s.time, s.lat, s.lon, s.temperature * w.weight AS t \
+         FROM w JOIN src s ON s.lat = w.src_lat AND s.lon = w.src_lon",
+    )
+    .await;
+
+    assert_eq!(shape, Err(RejectReason::JoinWithoutGroupBy));
+}
+
+#[tokio::test]
+async fn rejects_a_key_named_in_both_the_scan_and_the_table() {
+    let ctx = ctx_with_weights().await;
+    ctx.sql("CREATE TABLE r AS SELECT src_lat AS lat, src_lon AS lon, dst_lat FROM w")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let shape = shape_of(
+        &ctx,
+        "SELECT s.time, r.lat, avg(s.temperature) AS t \
+         FROM r JOIN src s ON s.lat = r.lat AND s.lon = r.lon GROUP BY s.time, r.lat",
+    )
+    .await;
+
+    assert_eq!(shape, Err(RejectReason::AmbiguousKey("lat".to_string())));
+}
+
+#[tokio::test]
+async fn rejects_two_zarr_scans_joined_and_an_outer_join() {
+    let ctx = ctx_with_weights().await;
+
+    for sql in [
+        "SELECT a.time, a.lat, a.lon, sum(a.temperature + b.temperature) AS t \
+         FROM src a JOIN src b ON a.time = b.time AND a.lat = b.lat AND a.lon = b.lon \
+         GROUP BY a.time, a.lat, a.lon",
+        "SELECT s.time, w.dst_lat, w.dst_lon, sum(s.temperature * w.weight) AS t \
+         FROM w LEFT JOIN src s ON s.lat = w.src_lat AND s.lon = w.src_lon \
+         GROUP BY s.time, w.dst_lat, w.dst_lon",
+    ] {
+        assert_eq!(
+            shape_of(&ctx, sql).await,
+            Err(RejectReason::NotSingleZarrScan),
+            "{sql}"
+        );
+    }
+}
+
+// --- a join with another Zarr store ----------------------------------------
+
+/// `src` with `m`, its mean temperature at each cell, written to a Zarr store
+/// of the test's own.
+async fn ctx_with_means(test: &str) -> SessionContext {
+    let ctx = create_baseline_context();
+    register_zarr_write_format(&ctx).expect("register format");
+    register_zarr_table(&ctx, "src", SRC);
+    let means = scratch(&format!("{test}_means.zarr"));
+    ctx.sql(&format!(
+        "COPY (SELECT lat, lon, avg(temperature) AS mean FROM src GROUP BY lat, lon) \
+         TO '{means}' STORED AS ZARR OPTIONS ('chunks' '5,4')"
+    ))
+    .await
+    .expect("plan means")
+    .collect()
+    .await
+    .expect("write means");
+    register_zarr_table(&ctx, "m", &means);
+    ctx
+}
+
+const ANOMALY: &str = "SELECT s.time, s.lat, s.lon, s.temperature - m.mean AS anomaly \
+     FROM m JOIN src s ON s.lat = m.lat AND s.lon = m.lon";
+
+#[tokio::test]
+async fn admits_a_projection_over_a_join_on_every_coordinate_of_another_store() {
+    let ctx = ctx_with_means("admits").await;
+
+    let shape = shape_of(&ctx, ANOMALY).await.expect("admitted");
+
+    assert_eq!(shape.grid_axes, vec!["time", "lat", "lon"]);
+    assert_eq!(shape.grid_axis_source, vec![Some(0), Some(1), Some(2)]);
+    assert!(!shape.is_reduce);
+    assert_eq!(shape.data_vars.len(), 1);
+}
+
+#[tokio::test]
+async fn rejects_a_projection_over_a_join_on_some_coordinates_of_another_store() {
+    let ctx = ctx_with_means("rejects").await;
+
+    // each source row meets every longitude's mean
+    let shape = shape_of(&ctx, &ANOMALY.replace(" AND s.lon = m.lon", "")).await;
+
+    assert_eq!(shape, Err(RejectReason::JoinWithoutGroupBy));
+}
+
+#[tokio::test]
+async fn a_join_on_a_coordinate_cast_without_loss_equates_it() {
+    let ctx = ctx_with_means("casts").await;
+    let cast = |to: &str| {
+        ANOMALY.replace(
+            "s.lon = m.lon",
+            &format!("CAST(s.lon AS {to}) = CAST(m.lon AS {to})"),
+        )
+    };
+
+    assert!(shape_of(&ctx, &cast("DOUBLE")).await.is_ok());
+    assert_eq!(
+        shape_of(&ctx, &cast("INT")).await,
+        Err(RejectReason::JoinWithoutGroupBy)
+    );
+}
+
+#[tokio::test]
+async fn copy_to_writes_a_projection_over_a_join_with_another_store() {
+    let ctx = ctx_with_means("copy_to").await;
+    let target = scratch("copyto_anomaly.zarr");
+
+    ctx.sql(&format!(
+        "COPY ({ANOMALY}) TO '{target}' STORED AS ZARR OPTIONS ('chunks' '1,5,4')"
+    ))
+    .await
+    .expect("plan COPY")
+    .collect()
+    .await
+    .expect("run COPY");
+
+    let tgt = create_baseline_context();
+    register_zarr_table(&tgt, "t", &target);
+    assert_eq!(
+        scalar_i64(&tgt, "SELECT count(*) FROM t").await,
+        7 * 10 * 12
+    );
+    // each value weighted by its cell, so a value in the wrong cell shows
+    let placed = "SELECT sum(anomaly * (1 + time + lat * 10 + lon * 100))";
+    let expected = scalar_f64(&ctx, &format!("{placed} FROM ({ANOMALY})")).await;
+    let written = scalar_f64(&tgt, &format!("{placed} FROM t")).await;
+    assert!(
+        (expected - written).abs() <= 1e-9 * expected.abs(),
+        "{expected} != {written}"
+    );
 }

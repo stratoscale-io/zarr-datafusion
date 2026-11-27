@@ -132,6 +132,20 @@ pub fn recognize(agg: &AggregateExec, zarr: &ZarrExec) -> Option<PushdownCandida
     })
 }
 
+/// A group key over a scan's coordinates alone: a bare coordinate column, or a
+/// periodic `date_part` of one.
+pub(crate) fn coordinate_key(
+    expr: &Arc<dyn PhysicalExpr>,
+    coord_axis: &HashMap<&str, usize>,
+) -> Option<GroupKey> {
+    column_axis(expr, coord_axis)
+        .map(GroupKey::Axis)
+        .or_else(|| {
+            date_part_periodic(expr, coord_axis)
+                .map(|(axis, period)| GroupKey::Periodic { axis, period })
+        })
+}
+
 /// The cube axis of a group key that is a bare coordinate column.
 fn column_axis(expr: &Arc<dyn PhysicalExpr>, coord_axis: &HashMap<&str, usize>) -> Option<usize> {
     let col = expr.downcast_ref::<Column>()?;

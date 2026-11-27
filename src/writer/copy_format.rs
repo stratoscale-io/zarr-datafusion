@@ -153,7 +153,7 @@ impl FileFormat for ZarrFileFormat {
     async fn create_writer_physical_plan(
         &self,
         input: Arc<dyn ExecutionPlan>,
-        _state: &dyn Session,
+        state: &dyn Session,
         conf: FileSinkConfig,
         _order_requirements: Option<LexRequirement>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -174,7 +174,7 @@ impl FileFormat for ZarrFileFormat {
             })?,
         };
 
-        let spec = derive_skeleton_spec(&input, chunks)
+        let spec = derive_skeleton_spec(&input, chunks, state.task_ctx())
             .await
             .map_err(DataFusionError::External)?;
         Ok(zarr_write_exec(input, target, spec, self.partitions))
@@ -185,10 +185,11 @@ impl FileFormat for ZarrFileFormat {
     }
 }
 
-/// The source store's data-variable chunk shape, if the plan reads one Zarr store.
+/// The source store's data-variable chunk shape, if the plan reads one Zarr store
+/// and nothing else, whose axes would be the output's.
 fn source_chunks(input: &Arc<dyn ExecutionPlan>) -> Option<Vec<u64>> {
-    let (_, zarr) = find_scan(input)?;
-    zarr.store_meta()?.data_vars.first()?.chunks.clone()
+    let source = find_scan(input).filter(|s| s.tables.is_empty())?;
+    source.zarr.store_meta()?.data_vars.first()?.chunks.clone()
 }
 
 /// Register `STORED AS ZARR` for `COPY TO` on a context. Idempotent-ish: overwrites

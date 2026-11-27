@@ -27,7 +27,12 @@ use zarrs::array::ArraySubset;
 use zarrs::storage::AsyncReadableListableStorage;
 use zarrs_object_store::object_store::path::Path as ObjectPath;
 
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::arrow::array::{Array as _, AsArray};
+use datafusion::arrow::compute::cast;
+use datafusion::arrow::datatypes::{DataType, Float64Type, Int64Type};
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::execution::TaskContext;
+use datafusion::physical_plan::{collect, ExecutionPlan};
 
 use crate::optimizer::cardinality::pushdown::field_range;
 use crate::reader::cf_time::apply_cf_time_conversion;
@@ -124,14 +129,16 @@ fn gather(values: &CoordValues, sel: &CoordSelection) -> CoordValues {
 
 /// Materialise a derived [`WriteShape`] into a [`SkeletonSpec`] by loading the
 /// source store's coordinate arrays (from `plan`'s scan) and gathering them by any
-/// coordinate filter. `chunks` is the target chunk shape, one entry per grid axis.
+/// coordinate filter, and reading a joined table's axes from it in `ctx`.
+/// `chunks` is the target chunk shape, one entry per grid axis.
 pub async fn materialize_spec(
     plan: &Arc<dyn ExecutionPlan>,
     shape: &WriteShape,
     chunks: Vec<u64>,
+    ctx: Arc<TaskContext>,
 ) -> Result<SkeletonSpec, BoxError> {
-    let (_, zarr) =
-        find_scan(plan).ok_or("plan has no single Zarr scan to read coordinates from")?;
+    let source = find_scan(plan).ok_or("plan has no single Zarr scan to read coordinates from")?;
+    let zarr = source.zarr;
     let meta = zarr.store_meta().ok_or("scan carries no store metadata")?;
     let (store, prefix) = zarr.open_store().await?;
 
@@ -162,13 +169,22 @@ pub async fn materialize_spec(
     };
 
     // Build the target grid axes, gathered by selection where present. A periodic
-    // axis spans its field's whole range, whatever the selection.
-    let grid_coords: Vec<CoordSpec> = shape
+    // axis spans its field's whole range, whatever the selection. A source axis
+    // keeps its stored values, so a CF time keeps its units and calendar too.
+    let mut grid_coords: Vec<CoordSpec> = Vec::with_capacity(shape.grid_axes.len());
+    for (name, column) in shape.grid_axes.iter().zip(&shape.grid_axis_table) {
+        if let Some(column) = column {
+            let values = table_axis(&source.tables, column, ctx.clone()).await?;
+            grid_coords.push(CoordSpec::new(name.clone(), values));
+        }
+    }
+    let source_coords: Vec<CoordSpec> = shape
         .grid_axis_source
         .iter()
         .zip(&shape.grid_axes)
         .zip(&shape.grid_axis_field)
-        .map(|((&src, name), field)| {
+        .filter_map(|((src, name), field)| Some((src.as_ref()?, name, field)))
+        .map(|(&src, name, field)| {
             let values = match (field, &selections) {
                 (Some(field), _) => {
                     let (first, last) = field_range(field)
@@ -178,9 +194,24 @@ pub async fn materialize_spec(
                 (None, Some(sels)) => gather(&coords[src], &sels[src]),
                 (None, None) => coords[src].clone(),
             };
-            Ok(CoordSpec::new(name.clone(), values))
+            let mut coord = CoordSpec::new(name.clone(), values);
+            if let (None, Some(cf)) = (field, &meta.coords[src].cf_time_attrs) {
+                if cf.is_time_coordinate() {
+                    coord
+                        .attributes
+                        .insert("units".into(), cf.units.clone().into());
+                    if let Some(calendar) = &cf.calendar {
+                        coord
+                            .attributes
+                            .insert("calendar".into(), calendar.clone().into());
+                    }
+                }
+            }
+            Ok(coord)
         })
         .collect::<Result<_, BoxError>>()?;
+    // the scan's axes come first, then the tables'
+    grid_coords.splice(0..0, source_coords);
 
     let data_vars: Vec<DataVarSpec> = shape
         .data_vars
@@ -197,7 +228,69 @@ pub async fn materialize_spec(
 pub async fn derive_skeleton_spec(
     plan: &Arc<dyn ExecutionPlan>,
     chunks: Vec<u64>,
+    ctx: Arc<TaskContext>,
 ) -> Result<SkeletonSpec, BoxError> {
     let shape: WriteShape = derive_write_shape(plan).map_err(|r| Box::new(r) as BoxError)?;
-    materialize_spec(plan, &shape, chunks).await
+    materialize_spec(plan, &shape, chunks, ctx).await
+}
+
+/// The distinct values of the joined table's `column`, ascending, read from
+/// whichever of `tables` has it.
+async fn table_axis(
+    tables: &[&Arc<dyn ExecutionPlan>],
+    column: &str,
+    ctx: Arc<TaskContext>,
+) -> Result<CoordValues, BoxError> {
+    let table = tables
+        .iter()
+        .find(|t| t.schema().column_with_name(column).is_some())
+        .ok_or_else(|| format!("no joined table has a column '{column}'"))?;
+    // A scan shares state across its partitions for one execution, so this reads
+    // a reset copy, leaving the query's own to run.
+    let copy = Arc::clone(table)
+        .transform_up(|node| Ok(Transformed::yes(node.reset_state()?)))?
+        .data;
+    let batches = collect(copy, ctx).await?;
+    let integer = table
+        .schema()
+        .field_with_name(column)?
+        .data_type()
+        .is_integer();
+    let mut columns = Vec::with_capacity(batches.len());
+    for batch in &batches {
+        let values = batch
+            .column_by_name(column)
+            .ok_or_else(|| format!("no column '{column}' in the table's rows"))?;
+        if values.null_count() > 0 {
+            return Err(format!("column '{column}' has nulls, which can't be an axis").into());
+        }
+        let to = if integer {
+            DataType::Int64
+        } else {
+            DataType::Float64
+        };
+        columns.push(
+            cast(values, &to).map_err(|e| format!("column '{column}' can't be an axis: {e}"))?,
+        );
+    }
+    Ok(if integer {
+        let mut axis: Vec<i64> = columns
+            .iter()
+            .flat_map(|c| c.as_primitive::<Int64Type>().values().to_vec())
+            .collect();
+        axis.sort_unstable();
+        axis.dedup();
+        CoordValues::Int64(axis)
+    } else {
+        let mut axis: Vec<f64> = columns
+            .iter()
+            .flat_map(|c| c.as_primitive::<Float64Type>().values().to_vec())
+            .collect();
+        if axis.iter().any(|v| v.is_nan()) {
+            return Err(format!("column '{column}' has NaNs, which can't be an axis").into());
+        }
+        axis.sort_unstable_by(f64::total_cmp);
+        axis.dedup();
+        CoordValues::Float64(axis)
+    })
 }
